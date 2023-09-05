@@ -1,0 +1,3 @@
+[submodule "FEMU/base"]
+	path = FEMU/base
+	url = git@github.com:vtess/FEMU.git
