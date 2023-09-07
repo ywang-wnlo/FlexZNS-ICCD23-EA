@@ -1,0 +1,2976 @@
+diff --git a/femu-scripts/femu-compile.sh b/femu-scripts/femu-compile.sh
+index 607e783ed..84a8c5e60 100755
+--- a/femu-scripts/femu-compile.sh
++++ b/femu-scripts/femu-compile.sh
+@@ -4,7 +4,7 @@ NRCPUS="$(cat /proc/cpuinfo | grep "vendor_id" | wc -l)"
+ 
+ make clean
+ # --disable-werror --extra-cflags=-w --disable-git-update
+-../configure --enable-kvm --target-list=x86_64-softmmu
++../configure --enable-kvm --target-list=x86_64-softmmu --disable-werror
+ make -j $NRCPUS
+ 
+ echo ""
+diff --git a/femu-scripts/run-zns.sh b/femu-scripts/run-zns.sh
+index eef584d22..286d07750 100755
+--- a/femu-scripts/run-zns.sh
++++ b/femu-scripts/run-zns.sh
+@@ -7,7 +7,7 @@
+ # Image directory
+ IMGDIR=$HOME/images
+ # Virtual machine disk image
+-OSIMGF=$IMGDIR/u20s.qcow2
++OSIMGF=$IMGDIR/zns-u22s.qcow2
+ 
+ if [[ ! -e "$OSIMGF" ]]; then
+ 	echo ""
+@@ -22,12 +22,13 @@ sudo x86_64-softmmu/qemu-system-x86_64 \
+     -name "FEMU-ZNSSD-VM" \
+     -enable-kvm \
+     -cpu host \
+-    -smp 4 \
+-    -m 4G \
++    -smp 16 \
++    -m 8G \
+     -device virtio-scsi-pci,id=scsi0 \
+     -device scsi-hd,drive=hd0 \
+     -drive file=$OSIMGF,if=none,aio=native,cache=none,format=qcow2,id=hd0 \
+-    -device femu,devsz_mb=4096,femu_mode=3 \
++    -device femu,devsz_mb=16384,femu_mode=1,queues=4,multipoller_enabled=1 \
++    -device femu,devsz_mb=262144,femu_mode=3,zone_size_mb=$1,azl=$2,zone_cap_align=$3,multipoller_enabled=1 \
+     -net user,hostfwd=tcp::8080-:22 \
+     -net nic,model=virtio \
+     -nographic \
+diff --git a/hw/femu/bbssd/ftl.c b/hw/femu/bbssd/ftl.c
+index bd9cd48aa..5d3d132b3 100644
+--- a/hw/femu/bbssd/ftl.c
++++ b/hw/femu/bbssd/ftl.c
+@@ -238,8 +238,8 @@ static void ssd_init_params(struct ssdparams *spp)
+ {
+     spp->secsz = 512;
+     spp->secs_per_pg = 8;
+-    spp->pgs_per_blk = 256;
+-    spp->blks_per_pl = 256; /* 16GB */
++    spp->pgs_per_blk = 128;
++    spp->blks_per_pl = 768; // total 24GB
+     spp->pls_per_lun = 1;
+     spp->luns_per_ch = 8;
+     spp->nchs = 8;
+@@ -282,8 +282,10 @@ static void ssd_init_params(struct ssdparams *spp)
+     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
+     spp->enable_gc_delay = true;
+ 
+-
+     check_params(spp);
++
++    ftl_log("[BBSSD] physical capacity: %dGB\n",
++             spp->tt_secs / 2 / 1024 / 1024);
+ }
+ 
+ static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)
+diff --git a/hw/femu/femu.c b/hw/femu/femu.c
+index 7e0b8de61..33728cb1f 100644
+--- a/hw/femu/femu.c
++++ b/hw/femu/femu.c
+@@ -535,6 +535,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
+     n->start_time = time(NULL);
+     n->reg_size = pow2ceil(0x1004 + 2 * (n->num_io_queues + 1) * 4);
+     n->ns_size = bs_size / (uint64_t)n->num_namespaces;
++    n->reserved_size = 0;
+ 
+     /* Coperd: [1..num_io_queues] are used as IO queues */
+     n->sq = g_malloc0(sizeof(*n->sq) * (n->num_io_queues + 1));
+@@ -601,10 +602,13 @@ static void femu_exit(PCIDevice *pci_dev)
+ 
+ static Property femu_props[] = {
+     DEFINE_PROP_STRING("serial", FemuCtrl, serial),
++    DEFINE_PROP_UINT32("zone_size_mb", FemuCtrl, zone_size_mb, 128), /* in MB */
+     DEFINE_PROP_UINT32("devsz_mb", FemuCtrl, memsz, 1024), /* in MB */
+     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
+     DEFINE_PROP_UINT32("queues", FemuCtrl, num_io_queues, 8),
+     DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
++    DEFINE_PROP_UINT32("azl", FemuCtrl, active_zones_limit, 16),
++    DEFINE_PROP_UINT8("zone_cap_align", FemuCtrl, zone_cap_align, 0),
+     DEFINE_PROP_UINT8("multipoller_enabled", FemuCtrl, multipoller_enabled, 0),
+     DEFINE_PROP_UINT8("max_cqes", FemuCtrl, max_cqes, 0x4),
+     DEFINE_PROP_UINT8("max_sqes", FemuCtrl, max_sqes, 0x6),
+diff --git a/hw/femu/meson.build b/hw/femu/meson.build
+index e24482154..42a9fe9e5 100644
+--- a/hw/femu/meson.build
++++ b/hw/femu/meson.build
+@@ -1 +1 @@
+-softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files('dma.c', 'intr.c', 'nvme-util.c', 'nvme-admin.c', 'nvme-io.c', 'femu.c', 'nossd/nop.c', 'nand/nand.c', 'timing-model/timing.c', 'ocssd/oc12.c', 'ocssd/oc20.c', 'zns/zns.c', 'bbssd/bb.c', 'bbssd/ftl.c', 'lib/pqueue.c', 'lib/rte_ring.c', 'backend/dram.c'))
++softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files('dma.c', 'intr.c', 'nvme-util.c', 'nvme-admin.c', 'nvme-io.c', 'femu.c', 'nossd/nop.c', 'nand/nand.c', 'timing-model/timing.c', 'ocssd/oc12.c', 'ocssd/oc20.c', 'zns/zns.c', 'zns/zns-ftl.c', 'bbssd/bb.c', 'bbssd/ftl.c', 'lib/pqueue.c', 'lib/rte_ring.c', 'backend/dram.c'))
+diff --git a/hw/femu/nvme-io.c b/hw/femu/nvme-io.c
+index dcecbd661..cef1a7444 100644
+--- a/hw/femu/nvme-io.c
++++ b/hw/femu/nvme-io.c
+@@ -73,18 +73,18 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
+         }
+ 
+         status = nvme_io_cmd(n, &cmd, req);
+-        if (1 && status == NVME_SUCCESS) {
+-            req->status = status;
++        req->status = status;
+ 
+-            int rc = femu_ring_enqueue(n->to_ftl[index_poller], (void *)&req, 1);
+-            if (rc != 1) {
+-                femu_err("enqueue failed, ret=%d\n", rc);
+-            }
+-        } else if (status == NVME_SUCCESS) {
+-            /* Normal I/Os that don't need delay emulation */
+-            req->status = status;
+-        } else {
+-            femu_err("Error IO processed!\n");
++        int rc = femu_ring_enqueue(n->to_ftl[index_poller], (void *)&req, 1);
++        if (rc != 1) {
++            femu_err("enqueue failed, ret=%d\n", rc);
++        }
++        if (status != NVME_SUCCESS) {
++            femu_err("%s Error IO processed! status[%#x]! opcode[%#x] cid[%#x] "
++                     "cdw10[%#x] cdw11[%#x] cdw12[%#x] cdw13[%#x] cdw14[%#x] "
++                     "cdw15[%#x]\n", n->devname, status, cmd.opcode, cmd.cid,
++                     cmd.cdw10, cmd.cdw11, cmd.cdw12, cmd.cdw13, cmd.cdw14,
++                     cmd.cdw15);
+         }
+ 
+         processed++;
+diff --git a/hw/femu/nvme.h b/hw/femu/nvme.h
+index 1b4f681cd..b803663d3 100644
+--- a/hw/femu/nvme.h
++++ b/hw/femu/nvme.h
+@@ -1175,21 +1175,26 @@ typedef struct FemuCtrl {
+     NvmeBar         bar;
+ 
+     /* Coperd: ZNS FIXME */
++    struct zns_ssd  *zns_ssd;
+     QemuUUID        uuid;
+     uint32_t        zasl_bs;
+     uint8_t         zasl;
+     bool            zoned;
+     bool            cross_zone_read;
+     uint64_t        zone_size_bs;
+-    bool            zone_cap_bs;
++    uint64_t        zone_cap_bs;
++    uint32_t        zone_size_mb;
++    uint32_t        active_zones_limit;
+     uint32_t        max_active_zones;
+     uint32_t        max_open_zones;
+     uint32_t        zd_extension_size;
++    uint8_t         zone_cap_align;
+ 
+     const uint32_t  *iocs;
+     uint8_t         csi;
+     NvmeIdNsZoned   *id_ns_zoned;
+     NvmeZone        *zone_array;
++    int32_t         *idx_offset;
+     QTAILQ_HEAD(, NvmeZone) exp_open_zones;
+     QTAILQ_HEAD(, NvmeZone) imp_open_zones;
+     QTAILQ_HEAD(, NvmeZone) closed_zones;
+@@ -1197,10 +1202,12 @@ typedef struct FemuCtrl {
+     uint32_t        num_zones;
+     uint64_t        zone_size;
+     uint64_t        zone_capacity;
++    uint64_t        reserved_size;
+     uint32_t        zone_size_log2;
+     uint8_t         *zd_extensions;
+     int32_t         nr_open_zones;
+     int32_t         nr_active_zones;
++    QemuSpin        zone_aor_lock;
+ 
+     /* Coperd: OC2.0 FIXME */
+     NvmeParams  params;
+@@ -1480,19 +1487,29 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
+ 
+ //#define FEMU_DEBUG_NVME
+ #ifdef FEMU_DEBUG_NVME
+-#define femu_debug(fmt, ...) \
+-    do { printf("[FEMU] Dbg: " fmt, ## __VA_ARGS__); } while (0)
++#define femu_debug(fmt, ...)                                                                                           \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        printf("[FEMU] Dbg: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                                           \
++    } while (0)
+ #else
+-#define femu_debug(fmt, ...) \
+-    do { } while (0)
++#define femu_debug(fmt, ...)                                                                                           \
++    do                                                                                                                 \
++    {                                                                                                                  \
++    } while (0)
+ #endif
+ 
+-#define femu_err(fmt, ...) \
+-    do { fprintf(stderr, "[FEMU] Err: " fmt, ## __VA_ARGS__); } while (0)
+-
+-#define femu_log(fmt, ...) \
+-    do { printf("[FEMU] Log: " fmt, ## __VA_ARGS__); } while (0)
+-
++#define femu_err(fmt, ...)                                                                                             \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        fprintf(stderr, "[FEMU] Err: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                                  \
++    } while (0)
++
++#define femu_log(fmt, ...)                                                                                             \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        printf("[FEMU] Log: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                                           \
++    } while (0)
+ 
+ #endif /* __FEMU_NVME_H */
+ 
+diff --git a/hw/femu/zns/zns-ftl.c b/hw/femu/zns/zns-ftl.c
+new file mode 100644
+index 000000000..db16dc30e
+--- /dev/null
++++ b/hw/femu/zns/zns-ftl.c
+@@ -0,0 +1,726 @@
++#include "zns-ftl.h"
++
++static void ssd_init_nand_page(struct nand_page *pg, struct zns_ssd_params *zspp)
++{
++    pg->status = PG_FREE;
++}
++
++static void ssd_init_nand_blk(struct nand_block *blk, struct zns_ssd_params *zspp)
++{
++    blk->npgs = zspp->pgs_per_blk;
++    blk->pg = g_malloc0(sizeof(struct nand_page) * blk->npgs);
++    for (int i = 0; i < blk->npgs; i++)
++    {
++        ssd_init_nand_page(&blk->pg[i], zspp);
++    }
++}
++
++static void ssd_init_nand_plane(struct nand_plane *pl, struct zns_ssd_params *zspp)
++{
++    pl->nblks = zspp->blks_per_pl;
++    pl->blk = g_malloc0(sizeof(struct nand_block) * pl->nblks);
++    for (int i = 0; i < pl->nblks; i++)
++    {
++        ssd_init_nand_blk(&pl->blk[i], zspp);
++    }
++}
++
++static void ssd_init_nand_lun(struct nand_lun *lun, struct zns_ssd_params *zspp)
++{
++    lun->npls = zspp->pls_per_lun;
++    lun->pl = g_malloc0(sizeof(struct nand_plane) * lun->npls);
++    for (int i = 0; i < lun->npls; i++)
++    {
++        ssd_init_nand_plane(&lun->pl[i], zspp);
++    }
++    lun->next_lun_avail_time = 0;
++}
++
++static void ssd_init_ch(struct ssd_channel *ch, struct zns_ssd_params *zspp)
++{
++    ch->nluns = zspp->luns_per_ch;
++    ch->lun = g_malloc0(sizeof(struct nand_lun) * ch->nluns);
++    for (int i = 0; i < ch->nluns; i++)
++    {
++        ssd_init_nand_lun(&ch->lun[i], zspp);
++    }
++}
++
++static uint32_t reserved_for_parity(FemuCtrl *n, struct zns_ssd_params *zspp)
++{
++    uint32_t resv_sb = 1, valid_zone_count;
++    uint64_t reserved_sec;
++
++    while (true)
++    {
++        reserved_sec = resv_sb * zspp->tt_pls * zspp->secs_per_blk;
++        valid_zone_count = (zspp->tt_secs - reserved_sec) / (zspp->zone_size / zspp->sec_size);
++        if (valid_zone_count <= resv_sb * zspp->tt_luns)
++        {
++            break;
++        }
++
++        resv_sb++;
++    }
++
++    zns_ftl_log("Reserved %d superblock for parity! %d zones, %d parity dies\n",
++                resv_sb, valid_zone_count, resv_sb * zspp->tt_luns);
++
++    return resv_sb;
++}
++
++static void check_zone_params(struct zns_ssd_params *zspp)
++{
++    if (!is_power_of_2(zspp->zone_size))
++        zns_ftl_error("zone_size is NOT power of 2!\n");
++
++    if (zspp->zone_capacity % (zspp->sec_size * zspp->secs_per_blk))
++        zns_ftl_error("zone_capacity is NOT integer multiple of block size\n");
++}
++
++static void zns_ssd_init_params(FemuCtrl *n, struct zns_ssd_params *zspp)
++{
++    zspp->zone_size = n->zone_size_mb * 1024 * 1024;
++
++    zspp->sec_size = 512;
++    zspp->secs_per_pg = 8;
++    zspp->pgs_per_blk = 2048; // block 8M, superblock 2G
++    zspp->blks_per_pl = 128;  // total 256G
++    zspp->pls_per_lun = 4;
++    zspp->luns_per_ch = 8;
++    zspp->nchs = 8;
++
++    zspp->pg_rd_lat = NAND_READ_LATENCY;
++    zspp->pg_wr_lat = NAND_PROG_LATENCY;
++    zspp->blk_er_lat = NAND_ERASE_LATENCY;
++
++    /* calculated values */
++    zspp->secs_per_blk = zspp->secs_per_pg * zspp->pgs_per_blk;
++    zspp->secs_per_pl = zspp->secs_per_blk * zspp->blks_per_pl;
++    zspp->secs_per_lun = zspp->secs_per_pl * zspp->pls_per_lun;
++    zspp->secs_per_ch = zspp->secs_per_lun * zspp->luns_per_ch;
++    zspp->tt_secs = zspp->secs_per_ch * zspp->nchs;
++
++    zspp->pgs_per_pl = zspp->pgs_per_blk * zspp->blks_per_pl;
++    zspp->pgs_per_lun = zspp->pgs_per_pl * zspp->pls_per_lun;
++    zspp->pgs_per_ch = zspp->pgs_per_lun * zspp->luns_per_ch;
++    zspp->tt_pgs = zspp->pgs_per_ch * zspp->nchs;
++
++    zspp->blks_per_lun = zspp->blks_per_pl * zspp->pls_per_lun;
++    zspp->blks_per_ch = zspp->blks_per_lun * zspp->luns_per_ch;
++    zspp->tt_blks = zspp->blks_per_ch * zspp->nchs;
++
++    zspp->pls_per_ch = zspp->pls_per_lun * zspp->luns_per_ch;
++    zspp->tt_pls = zspp->pls_per_ch * zspp->nchs;
++
++    zspp->tt_luns = zspp->luns_per_ch * zspp->nchs;
++
++    zspp->zone_capacity = zspp->zone_size;
++    if (1 != n->zone_cap_align)
++    {
++        zspp->reserved_sb = 0;
++        zspp->zone_capacity -= zspp->pls_per_lun * zspp->secs_per_blk * zspp->sec_size;
++    }
++    else
++    {
++        zspp->reserved_sb = reserved_for_parity(n, zspp);
++    }
++    n->reserved_size = (uint64_t)zspp->reserved_sb * zspp->tt_pls * zspp->secs_per_blk * zspp->sec_size;
++
++    check_zone_params(zspp);
++
++    zspp->secs_per_zone = zspp->zone_size / zspp->sec_size;
++    zspp->pgs_per_zone = zspp->secs_per_zone / zspp->secs_per_pg;
++    zspp->blks_per_zone = zspp->pgs_per_zone / zspp->pgs_per_blk;
++    zspp->tt_zones = (zspp->tt_blks - zspp->reserved_sb * zspp->tt_pls) / zspp->blks_per_zone;
++
++    zns_ftl_log("[ZNS] physical capacity: %dGB, block: %dM, superblock: %dM\n", zspp->tt_secs / 2 / 1024 / 1024,
++                zspp->secs_per_blk / 2 / 1024, zspp->secs_per_blk * zspp->tt_pls / 2 / 1024);
++}
++
++static inline void block2sppa(struct zns_ssd_params *zspp, uint32_t block_id, struct ppa *sppa)
++{
++    // 优先 pl -> ch -> lun 并行
++    sppa->g.ch = block_id / zspp->pls_per_lun % zspp->nchs;
++    sppa->g.lun = block_id / (zspp->nchs * zspp->pls_per_lun) % zspp->luns_per_ch;
++    sppa->g.pl = block_id % zspp->pls_per_lun;
++    sppa->g.blk = block_id / zspp->tt_pls;
++    // 简化了细节，无需考虑 page
++    sppa->g.pg = 0;
++    sppa->g.sec = 0;
++}
++
++static void zns_ssd_init_blks_usage(ZNS_SSD *zns_ssd)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    struct zns_blks_usage *blks_usage = &zns_ssd->blks_usage;
++
++    blks_usage->nblk = zspp->blks_per_zone;
++    blks_usage->width = zspp->tt_pls / zspp->blks_per_zone;
++    blks_usage->depth = zspp->blks_per_pl - zspp->reserved_sb;
++    blks_usage->used = g_malloc0(sizeof(unsigned long *) * blks_usage->width);
++    blks_usage->next = g_malloc0(sizeof(uint32_t) * blks_usage->width);
++
++    for (int i = 0; i < blks_usage->width; i++)
++    {
++        blks_usage->used[i] = bitmap_new(blks_usage->depth);
++    }
++
++#ifdef FEMU_DEBUG_ZNS_FTL
++    zns_ftl_debug("nblk[%u],width[%u],depth[%u]\n", blks_usage->nblk, blks_usage->width, blks_usage->depth);
++    zns_ftl_debug("used");
++    for (int i = 0; i < blks_usage->width; i++)
++    {
++        printf("[%lu]", bitmap_count_one(blks_usage->used[i], blks_usage->depth));
++    }
++    printf("\n");
++#endif
++}
++
++#ifdef FEMU_DEBUG_ZNS_FTL
++static void print_map(struct zns_ssd_params *zspp)
++{
++    struct ppa ppa;
++    for (int block_id = 0; block_id < 2 * zspp->tt_pls; block_id++)
++    {
++        block2sppa(zspp, block_id, &ppa);
++        zns_ftl_debug("block_id: %d, sppa[ch-lun-pl-blk]: %d-%d-%d-%d 0x%016lx\n", block_id, ppa.g.ch, ppa.g.lun,
++                      ppa.g.pl, ppa.g.blk, ppa.ppa);
++        usleep(1000);
++    }
++}
++#endif
++
++static void zns_ssd_init_maptbl(ZNS_SSD *zns_ssd)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    struct zns_blks_usage *blks_usage = &zns_ssd->blks_usage;
++    struct zns_maptbl *zns_map_entry;
++    zns_ssd->maptbl = g_malloc0(sizeof(struct zns_maptbl) * zspp->tt_zones);
++    uint64_t slba = 0;
++
++    for (int zone_id = 0; zone_id < zspp->tt_zones; zone_id++)
++    {
++        zns_map_entry = &zns_ssd->maptbl[zone_id];
++        zns_map_entry->id = zone_id;
++        zns_map_entry->slba = slba;
++        zns_map_entry->mask = bitmap_new(blks_usage->width);
++        bitmap_fill(zns_map_entry->mask, blks_usage->width);
++        zns_map_entry->mapped = false;
++        zns_map_entry->nblk = zspp->blks_per_zone;
++        zns_map_entry->blk_ids = g_malloc0(sizeof(uint32_t) * zns_map_entry->nblk);
++        zns_map_entry->p_nblk = zspp->pls_per_lun;
++        // FIXME: 直接二倍是为了避免二次扩容
++        zns_map_entry->p_blk_ids = g_malloc0(sizeof(uint32_t) * zns_map_entry->p_nblk * 2);
++        slba += zspp->secs_per_zone;
++    }
++
++#ifdef FEMU_DEBUG_ZNS_FTL
++    print_map(zspp);
++#endif
++}
++
++void zns_ssd_init(FemuCtrl *n)
++{
++    ZNS_SSD *zns_ssd = n->zns_ssd;
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++
++    zns_ssd_init_params(n, zspp);
++
++    /* initialize zns_ssd internal layout architecture */
++    zns_ssd->ch = g_malloc0(sizeof(struct ssd_channel) * zspp->nchs);
++    for (int i = 0; i < zspp->nchs; i++)
++    {
++        ssd_init_ch(&zns_ssd->ch[i], zspp);
++    }
++
++    /* initialize blks_usage */
++    zns_ssd_init_blks_usage(zns_ssd);
++
++    /* initialize maptbl zone->blocks */
++    zns_ssd_init_maptbl(zns_ssd);
++
++    /* initialize spinlock for nand emulate/zone mapping */
++    qemu_spin_init(&zns_ssd->nand_lock);
++    qemu_spin_init(&zns_ssd->map_lock);
++}
++
++static inline uint32_t best_blks_width_index(struct zns_blks_usage *blks_usage, unsigned long *ban_mask)
++{
++    uint32_t w_index = -1, min_used = -1;
++
++    for (uint32_t i = 0; i < blks_usage->width; i++)
++    {
++        if ((ban_mask && test_bit(i, ban_mask)) || bitmap_full(blks_usage->used[i], blks_usage->depth))
++        {
++            continue;
++        }
++
++        if (bitmap_count_one(blks_usage->used[i], blks_usage->depth) <= min_used)
++        {
++            min_used = bitmap_count_one(blks_usage->used[i], blks_usage->depth);
++            w_index = i;
++        }
++    }
++
++    return w_index;
++}
++
++static inline uint32_t best_blks_depth_index(struct zns_blks_usage *blks_usage, uint32_t w_index)
++{
++    uint32_t d_index = -1;
++
++    d_index = find_next_zero_bit(blks_usage->used[w_index], blks_usage->depth, blks_usage->next[w_index]);
++    if (d_index == blks_usage->depth)
++    {
++        d_index = find_first_zero_bit(blks_usage->used[w_index], blks_usage->depth);
++    }
++
++    if (d_index == blks_usage->depth)
++    {
++        zns_ftl_error("No free-blocks in w_index[%u]!\n", w_index);
++    }
++
++    return d_index;
++}
++
++static void map_parity_blocks(ZNS_SSD *zns_ssd, struct zns_maptbl *zns_map_entry)
++{
++    struct zns_blks_usage *blks_usage = &zns_ssd->blks_usage;
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++
++    for (uint32_t i = 0; i < zns_map_entry->p_nblk; i += zspp->pls_per_lun)
++    {
++        uint32_t block_id = zns_map_entry->blk_ids[i / zspp->pls_per_lun * blks_usage->nblk];
++        uint32_t d_index = block_id / zspp->tt_pls;
++        uint32_t w_index = block_id % zspp->tt_pls / blks_usage->nblk;
++        uint32_t p_w_index = (w_index + 1) % blks_usage->width;
++        // 简化，不去确定实际的 superblock
++        zns_map_entry->p_blk_ids[i] = p_w_index * blks_usage->nblk + d_index * zspp->pls_per_lun % blks_usage->nblk;
++        for (uint32_t j = i + 1; j < zns_map_entry->p_nblk; j++)
++        {
++            zns_map_entry->p_blk_ids[j] = zns_map_entry->p_blk_ids[j - 1] + 1;
++        }
++#ifdef FEMU_DEBUG_ZNS_FTL
++        printf(", parity blocks[%u+%u]", zns_map_entry->p_blk_ids[i], zspp->pls_per_lun);
++#endif
++    }
++}
++
++static void map_zone_blks(ZNS_SSD *zns_ssd, struct zns_maptbl *zns_map_entry)
++{
++    qemu_spin_lock(&zns_ssd->map_lock);
++    struct zns_blks_usage *blks_usage = &zns_ssd->blks_usage;
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    uint32_t w_index = -1, d_index = -1;
++    unsigned long *ban_mask = bitmap_new(blks_usage->width);
++
++    if (zns_map_entry->mapped)
++    {
++        qemu_spin_unlock(&zns_ssd->map_lock);
++        return;
++    }
++
++    bitmap_complement(ban_mask, zns_map_entry->mask, blks_usage->width);
++    zns_ftl_debug("map zone[%u]", zns_map_entry->id);
++    for (uint32_t i = 0; i < zns_map_entry->nblk; i += blks_usage->nblk)
++    {
++        // get blks index
++        w_index = best_blks_width_index(blks_usage, ban_mask);
++        if (w_index == -1)
++        {
++            zns_ftl_error("No free-blocks for ban_mask[%#lx]!\n", *ban_mask);
++        }
++        d_index = best_blks_depth_index(blks_usage, w_index);
++
++        // update blks_usage
++        set_bit(w_index, ban_mask);
++        set_bit(d_index, blks_usage->used[w_index]);
++        blks_usage->next[w_index] = (d_index + 1) % blks_usage->depth;
++
++        // update mapping
++        zns_map_entry->blk_ids[i] = d_index * zspp->tt_pls + w_index * blks_usage->nblk;
++        for (uint32_t j = 1; j < blks_usage->nblk; j++)
++        {
++            zns_map_entry->blk_ids[i + j] = zns_map_entry->blk_ids[i + j - 1] + 1;
++        }
++#ifdef FEMU_DEBUG_ZNS_FTL
++        printf(", blocks[%u+%u]used[%u]->%lu", zns_map_entry->blk_ids[i], blks_usage->nblk, w_index,
++               bitmap_count_one(blks_usage->used[w_index], blks_usage->depth));
++#endif
++    }
++
++    if (zspp->zone_size != zspp->zone_capacity)
++    {
++        // 默认用尾部
++        uint32_t parity_offset = zns_map_entry->nblk - zspp->pls_per_lun;
++        zns_map_entry->p_blk_ids[0] = zns_map_entry->blk_ids[parity_offset];
++        for (uint32_t k = 1; k < zns_map_entry->p_nblk; k++)
++        {
++            zns_map_entry->p_blk_ids[k] = zns_map_entry->p_blk_ids[k - 1] + 1;
++        }
++#ifdef FEMU_DEBUG_ZNS_FTL
++        printf(", parity blocks[%u+%u]", zns_map_entry->p_blk_ids[0], zspp->pls_per_lun);
++#endif
++    }
++    else
++    {
++        map_parity_blocks(zns_ssd, zns_map_entry);
++    }
++#ifdef FEMU_DEBUG_ZNS_FTL
++    printf("\n");
++#endif
++
++    zns_map_entry->mapped = true;
++    qemu_spin_unlock(&zns_ssd->map_lock);
++}
++
++static void unmap_zone_blks(ZNS_SSD *zns_ssd, struct zns_maptbl *zns_map_entry)
++{
++    qemu_spin_lock(&zns_ssd->map_lock);
++    struct zns_blks_usage *blks_usage = &zns_ssd->blks_usage;
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    uint32_t w_index = -1, d_index = -1;
++
++    if (false == zns_map_entry->mapped)
++    {
++        qemu_spin_unlock(&zns_ssd->map_lock);
++        return;
++    }
++
++    zns_ftl_debug("unmap zone[%u]", zns_map_entry->id);
++    for (uint32_t i = 0; i < zns_map_entry->nblk; i += blks_usage->nblk)
++    {
++        w_index = zns_map_entry->blk_ids[i] % zspp->tt_pls / blks_usage->nblk;
++        d_index = zns_map_entry->blk_ids[i] / zspp->tt_pls;
++
++        clear_bit(d_index, blks_usage->used[w_index]);
++#ifdef FEMU_DEBUG_ZNS_FTL
++        printf(", used[%u]->%lu", w_index, bitmap_count_one(blks_usage->used[w_index], blks_usage->depth));
++#endif
++    }
++#ifdef FEMU_DEBUG_ZNS_FTL
++    printf("\n");
++#endif
++
++    memset(zns_map_entry->blk_ids, 0, sizeof(uint32_t) * zns_map_entry->nblk);
++    zns_map_entry->mapped = false;
++    qemu_spin_unlock(&zns_ssd->map_lock);
++}
++
++static bool zns_lpn2ppa(ZNS_SSD *zns_ssd, uint64_t lpn, struct ppa *ppa, bool is_write)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    uint32_t zone_id = lpn / zspp->pgs_per_zone;
++    struct zns_maptbl *zns_map_entry = &zns_ssd->maptbl[zone_id];
++    uint32_t blk_index = 0;
++    uint64_t slpn = 0;
++
++    bool last_lpn = false;
++
++    zone_id += zns_map_entry->offset;
++    zns_map_entry = &zns_ssd->maptbl[zone_id];
++    if ((false == zns_map_entry->mapped) && (is_write == true))
++    {
++        map_zone_blks(zns_ssd, zns_map_entry);
++    }
++    slpn = zns_map_entry->slba / zspp->secs_per_pg;
++
++    if (zspp->zone_size != zspp->zone_capacity)
++    {
++        blk_index = (lpn - slpn) % (zns_map_entry->nblk - zspp->pls_per_lun);
++        if (blk_index == zns_map_entry->nblk - zspp->pls_per_lun - 1)
++        {
++            last_lpn = true;
++        }
++    }
++    else
++    {
++        blk_index = (lpn - slpn) % zns_map_entry->nblk;
++    }
++    block2sppa(zspp, zns_map_entry->blk_ids[blk_index], ppa);
++
++    return last_lpn;
++}
++
++static inline struct ssd_channel *get_ch(ZNS_SSD *zns_ssd, struct ppa *ppa)
++{
++    return &(zns_ssd->ch[ppa->g.ch]);
++}
++
++static inline struct nand_lun *get_lun(ZNS_SSD *zns_ssd, struct ppa *ppa)
++{
++    struct ssd_channel *ch = get_ch(zns_ssd, ppa);
++    return &(ch->lun[ppa->g.lun]);
++}
++
++static uint64_t ssd_advance_status(ZNS_SSD *zns_ssd, struct ppa *ppa, int ncmd_type, int64_t ncmd_stime)
++{
++    uint64_t nand_stime;
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    struct nand_lun *lun = get_lun(zns_ssd, ppa);
++    uint64_t lat = 0;
++
++    qemu_spin_lock(&zns_ssd->nand_lock);
++    nand_stime = (lun->next_lun_avail_time < ncmd_stime) ? ncmd_stime : lun->next_lun_avail_time;
++
++    switch (ncmd_type)
++    {
++    case NAND_READ:
++        lun->next_lun_avail_time = nand_stime + zspp->pg_rd_lat;
++        break;
++    case NAND_WRITE:
++        lun->next_lun_avail_time = nand_stime + zspp->pg_wr_lat;
++        break;
++    case NAND_ERASE:
++        lun->next_lun_avail_time = nand_stime + zspp->blk_er_lat;
++        break;
++    default:
++        zns_ftl_error("Unsupported NAND command: 0x%x\n", ncmd_type);
++    }
++
++    lat = lun->next_lun_avail_time - ncmd_stime;
++    qemu_spin_unlock(&zns_ssd->nand_lock);
++
++    return lat;
++}
++
++#ifdef ENABLE_MULTI_PLANE
++static bool multi_plane(ZNS_SSD *zns_ssd, uint64_t cur_lpn, uint64_t start_lpn)
++{
++    // TODO: 当前仅支持同一请求的内的 multi plane 操作
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++
++    if ((cur_lpn > start_lpn) && (cur_lpn % zspp->pls_per_lun))
++    {
++        return true;
++    }
++
++    // 同 lun、以及 pg 偏移的操作不在同一请求内时，或者是第一次被操作，无法执行 multi plane 操作
++    return false;
++}
++#else
++static bool multi_plane(ZNS_SSD *zns_ssd, uint64_t cur_lpn, uint64_t start_lpn)
++{
++    return false;
++}
++#endif // ENABLE_MULTI_PLANE
++
++static void zns_ssd_write_parity(ZNS_SSD *zns_ssd, uint64_t lpn, int64_t ncmd_stime)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    uint32_t zone_id = lpn / zspp->pgs_per_zone;
++    struct zns_maptbl *zns_map_entry = &zns_ssd->maptbl[zone_id];
++    zone_id += zns_map_entry->offset;
++    zns_map_entry = &zns_ssd->maptbl[zone_id];
++    struct ppa ppa;
++
++    for (uint32_t i = 0; i < zns_map_entry->p_nblk; i++)
++    {
++        if (!multi_plane(zns_ssd, i, 0))
++        {
++            block2sppa(zspp, zns_map_entry->p_blk_ids[i], &ppa);
++            ssd_advance_status(zns_ssd, &ppa, NAND_WRITE, ncmd_stime);
++        }
++    }
++}
++
++void zns_ssd_rw(ZNS_SSD *zns_ssd, NvmeRequest *req)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
++    uint64_t start_lpn = le64_to_cpu(rw->slba) / zspp->secs_per_pg;
++    uint64_t end_lpn = (le64_to_cpu(rw->slba) + (uint32_t)le16_to_cpu(rw->nlb)) / zspp->secs_per_pg;
++    uint64_t sublat, maxlat = 0;
++    int ncmd_type = -1;
++    bool last_lpn = false;
++    struct ppa ppa;
++
++    switch (rw->opcode)
++    {
++    case NVME_CMD_READ:
++        ncmd_type = NAND_READ;
++        break;
++    case NVME_CMD_WRITE:
++        ncmd_type = NAND_WRITE;
++        break;
++    }
++
++    for (uint64_t lpn = start_lpn; lpn <= end_lpn; lpn++)
++    {
++        if (!multi_plane(zns_ssd, lpn, start_lpn))
++        {
++            last_lpn = zns_lpn2ppa(zns_ssd, lpn, &ppa, ncmd_type == NAND_WRITE);
++            sublat = ssd_advance_status(zns_ssd, &ppa, ncmd_type, req->stime);
++            maxlat = (sublat > maxlat) ? sublat : maxlat;
++        }
++        if ((ncmd_type == NAND_WRITE) && last_lpn)
++        {
++            zns_ssd_write_parity(zns_ssd, lpn, req->stime); // 忽略校验的计算延迟
++        }
++    }
++
++    req->reqlat = maxlat;
++    req->expire_time += maxlat;
++}
++
++void zns_ssd_append(ZNS_SSD *zns_ssd, NvmeRequest *req, uint64_t zone_wp)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
++    uint64_t start_lpn = zone_wp / zspp->secs_per_pg;
++    uint64_t end_lpn = (zone_wp + (uint32_t)le16_to_cpu(rw->nlb)) / zspp->secs_per_pg;
++    uint64_t sublat, maxlat = 0;
++    struct ppa ppa;
++
++    for (uint64_t lpn = start_lpn; lpn <= end_lpn; lpn++)
++    {
++        if (!multi_plane(zns_ssd, lpn, start_lpn))
++        {
++            zns_lpn2ppa(zns_ssd, lpn, &ppa, true);
++            sublat = ssd_advance_status(zns_ssd, &ppa, NAND_WRITE, req->stime);
++            maxlat = (sublat > maxlat) ? sublat : maxlat;
++        }
++    }
++
++    req->reqlat = maxlat;
++    req->expire_time += maxlat;
++}
++
++void zns_ssd_async_reset(ZNS_SSD *zns_ssd, NvmeRequest *req, uint64_t slba)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    uint64_t start_lpn = slba / zspp->secs_per_pg;
++    uint32_t zone_id = start_lpn / zspp->pgs_per_zone;
++    struct zns_maptbl *zns_map_entry = &zns_ssd->maptbl[zone_id];
++    zns_map_entry = &zns_ssd->maptbl[zone_id + zns_map_entry->offset];
++    uint64_t end_lpn = start_lpn + zns_map_entry->nblk - 1;
++    struct ppa ppa;
++
++    for (uint64_t lpn = start_lpn; lpn <= end_lpn; lpn++)
++    {
++        if (!multi_plane(zns_ssd, lpn, start_lpn))
++        {
++            zns_lpn2ppa(zns_ssd, lpn, &ppa, false);
++            ssd_advance_status(zns_ssd, &ppa, NAND_ERASE, req->stime);
++        }
++    }
++
++    if (zspp->zone_size == zspp->zone_capacity)
++    {
++        for (uint32_t i = 0; i < zns_map_entry->p_nblk; i += zspp->pls_per_lun)
++        {
++            // must multi_plane, only once
++            uint32_t p_lun = zns_map_entry->p_blk_ids[i] / zspp->pls_per_lun;
++            ppa.g.ch = p_lun % zspp->luns_per_ch;
++            ppa.g.lun = p_lun / zspp->luns_per_ch;
++            ppa.g.pl = 0;
++            ppa.g.blk = 0;
++            ppa.g.pg = 0;
++            ppa.g.sec = 0;
++            ssd_advance_status(zns_ssd, &ppa, NAND_ERASE, req->stime);
++        }
++    }
++
++    unmap_zone_blks(zns_ssd, zns_map_entry);
++    // Async erase, just return
++}
++
++void zns_ssd_merge_zones(ZNS_SSD *zns_ssd, uint32_t zone_id, uint32_t count)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    struct zns_maptbl *zns_map_entry = &zns_ssd->maptbl[zone_id];
++    unmap_zone_blks(zns_ssd, zns_map_entry);
++    zns_map_entry->nblk = zspp->blks_per_zone * count;
++    if ((zspp->reserved_sb) && (zns_map_entry->nblk == zspp->pls_per_lun * zspp->tt_luns))
++    {
++        zns_map_entry->p_nblk = 2 * zspp->pls_per_lun;
++    }
++
++    for (uint32_t i = 1; i < count; i++)
++    {
++        zns_map_entry = &zns_ssd->maptbl[zone_id + i];
++        unmap_zone_blks(zns_ssd, zns_map_entry);
++        zns_map_entry->offset = -i;
++    }
++}
++
++void zns_ssd_split_zones(ZNS_SSD *zns_ssd, uint32_t zone_id)
++{
++    struct zns_ssd_params *zspp = &zns_ssd->zsp;
++    struct zns_maptbl *zns_map_entry = &zns_ssd->maptbl[zone_id];
++    unmap_zone_blks(zns_ssd, zns_map_entry);
++    zns_map_entry->nblk = zspp->blks_per_zone;
++    if (zns_map_entry->p_nblk == 2 * zspp->pls_per_lun)
++    {
++        zns_ftl_error("Not support split superblock zone!\n");
++    }
++
++    for (uint32_t i = 1; zone_id + i < zspp->tt_zones; i++)
++    {
++        zns_map_entry = &zns_ssd->maptbl[zone_id + i];
++        if (zns_map_entry->offset == -i)
++        {
++            zns_map_entry->offset = 0;
++        }
++        else
++        {
++            break;
++        }
++    }
++}
++
++static inline void zns_set_mask(FemuCtrl *n, NvmeCmd *cmd)
++{
++    ZNS_SSD *zns_ssd = n->zns_ssd;
++    uint32_t opcode = le32_to_cpu(cmd->cdw10);
++    uint32_t zone_id = le32_to_cpu(cmd->cdw11);
++    uint32_t count = le32_to_cpu(cmd->cdw12);
++    uint32_t mask = le32_to_cpu(cmd->cdw13);
++    struct zns_blks_usage *blks_usage = &zns_ssd->blks_usage;
++    struct zns_maptbl *zns_map_entry = NULL;
++
++    if (opcode == FEMU_CLEAR_MASK)
++    {
++        mask = ~0U;
++        zns_ftl_log("%s, FEMU Zone[%u+%u] Clear Mask!\n", n->devname, zone_id, count);
++    }
++    else
++    {
++        zns_ftl_log("%s, FEMU Zone[%u+%u] Set Mask[%#x]!\n", n->devname, zone_id, count, mask);
++    }
++
++    for (uint32_t i = 0; i < count; i++)
++    {
++        zns_map_entry = &zns_ssd->maptbl[zone_id + i];
++        bitmap_copy(zns_map_entry->mask, &mask, blks_usage->width);
++    }
++}
++
++void zns_flip(FemuCtrl *n, NvmeCmd *cmd)
++{
++    ZNS_SSD *zns_ssd = n->zns_ssd;
++    int64_t cdw10 = le64_to_cpu(cmd->cdw10);
++
++    switch (cdw10)
++    {
++    case FEMU_SET_MASK:
++    case FEMU_CLEAR_MASK:
++        zns_set_mask(n, cmd);
++        break;
++    case FEMU_ENABLE_DELAY_EMU:
++        zns_ssd->zsp.pg_rd_lat = NAND_READ_LATENCY;
++        zns_ssd->zsp.pg_wr_lat = NAND_PROG_LATENCY;
++        zns_ssd->zsp.blk_er_lat = NAND_ERASE_LATENCY;
++        zns_ftl_log("%s, FEMU Delay Emulation [Enabled]!\n", n->devname);
++        break;
++    case FEMU_DISABLE_DELAY_EMU:
++        zns_ssd->zsp.pg_rd_lat = 0;
++        zns_ssd->zsp.pg_wr_lat = 0;
++        zns_ssd->zsp.blk_er_lat = 0;
++        zns_ftl_log("%s, FEMU Delay Emulation [Disabled]!\n", n->devname);
++        break;
++    default:
++        zns_ftl_log("FEMU:%s, Not implemented flip cmd (%lu)\n", n->devname, cdw10);
++    }
++}
+diff --git a/hw/femu/zns/zns-ftl.h b/hw/femu/zns/zns-ftl.h
+new file mode 100644
+index 000000000..96da134bd
+--- /dev/null
++++ b/hw/femu/zns/zns-ftl.h
+@@ -0,0 +1,201 @@
++#ifndef __FEMU_ZNS_FTL_H
++#define __FEMU_ZNS_FTL_H
++
++#include "../nvme.h"
++
++#define ENABLE_MULTI_PLANE
++
++enum
++{
++    NAND_READ = 0,
++    NAND_WRITE = 1,
++    NAND_ERASE = 2,
++
++    NAND_READ_LATENCY = 50000,
++    NAND_PROG_LATENCY = 500000,
++    NAND_ERASE_LATENCY = 5000000,
++};
++
++enum
++{
++    PG_FREE = 0,
++    PG_INVALID = 1,
++    PG_VALID = 2
++};
++
++enum
++{
++    FEMU_SET_MASK = 1,
++    FEMU_CLEAR_MASK = 2,
++
++    FEMU_ENABLE_DELAY_EMU = 3,
++    FEMU_DISABLE_DELAY_EMU = 4,
++};
++
++struct zns_ssd_params
++{
++    uint64_t zone_size;     /* zone size in bytes */
++    uint64_t zone_capacity; /* zone capacity in bytes */
++    uint32_t reserved_sb;   /* # of reserved superblock for parity */
++
++    int sec_size;    /* sector size in bytes */
++    int secs_per_pg; /* # of sectors per page */
++    int pgs_per_blk; /* # of NAND pages per block */
++    int blks_per_pl; /* # of blocks per plane */
++    int pls_per_lun; /* # of planes per LUN (Die) */
++    int luns_per_ch; /* # of LUNs per channel */
++    int nchs;        /* # of channels in the SSD */
++
++    int pg_rd_lat;  /* NAND page read latency in nanoseconds */
++    int pg_wr_lat;  /* NAND page program latency in nanoseconds */
++    int blk_er_lat; /* NAND block erase latency in nanoseconds */
++
++    /* below are all calculated values */
++    int secs_per_blk; /* # of sectors per block */
++    int secs_per_pl;  /* # of sectors per plane */
++    int secs_per_lun; /* # of sectors per LUN */
++    int secs_per_ch;  /* # of sectors per channel */
++    int tt_secs;      /* # of sectors in the SSD */
++
++    int pgs_per_pl;  /* # of pages per plane */
++    int pgs_per_lun; /* # of pages per LUN */
++    int pgs_per_ch;  /* # of pages per channel */
++    int tt_pgs;      /* total # of pages in the SSD */
++
++    int blks_per_lun; /* # of blocks per LUN */
++    int blks_per_ch;  /* # of blocks per channel */
++    int tt_blks;      /* total # of blocks in the SSD */
++
++    int pls_per_ch; /* # of planes per channel */
++    int tt_pls;     /* total # of planes in the SSD */
++
++    int tt_luns; /* total # of LUNs in the SSD */
++
++    int secs_per_zone; /* # of sectors per zone */
++    int pgs_per_zone;  /* # of pages per zone */
++    int blks_per_zone; /* # of blocks per zone */
++    int tt_zones;      /* total # of zones in the SSD */
++};
++
++struct nand_page
++{
++    int status;
++};
++
++struct nand_block
++{
++    struct nand_page *pg;
++    int npgs;
++};
++
++struct nand_plane
++{
++    struct nand_block *blk;
++    int nblks;
++};
++
++struct nand_lun
++{
++    struct nand_plane *pl;
++    int npls;
++    uint64_t next_lun_avail_time;
++};
++
++struct ssd_channel
++{
++    struct nand_lun *lun;
++    int nluns;
++};
++
++#define CH_BITS (8)
++#define LUN_BITS (8)
++#define PL_BITS (8)
++#define BLK_BITS (16)
++#define PG_BITS (16)
++#define SEC_BITS (8)
++
++/* describe a physical ppa addr */
++struct ppa
++{
++    union {
++        struct
++        {
++            uint64_t sec : SEC_BITS;
++            uint64_t pg : PG_BITS;
++            uint64_t blk : BLK_BITS;
++            uint64_t pl : PL_BITS;
++            uint64_t lun : LUN_BITS;
++            uint64_t ch : CH_BITS;
++        } g;
++
++        uint64_t ppa;
++    };
++};
++
++struct zns_blks_usage
++{
++    uint32_t nblk;        // 最小划分粒度
++    uint32_t width;       // = blks_per_superblock / nblk
++    uint32_t depth;       // = blks_per_pl
++    unsigned long **used; // width * depth (bit)
++    uint32_t *next;       // 分配的起始序号（磨损均衡、隐藏擦除延迟
++};
++
++struct zns_maptbl
++{
++    uint32_t id;         // zone 的逻辑 id
++    uint64_t slba;       // zone 的起始 lba
++    unsigned long *mask; // 用于硬隔离的掩码
++    bool mapped;         // 是否映射到实际 block
++    uint32_t nblk;       // zone 包含的 block 数量
++    uint32_t *blk_ids;   // zone 的实际映射 block ids
++    uint32_t p_nblk;     // zone 包含的 parity block 数量
++    uint32_t *p_blk_ids; // zone 的实际映射 parity block ids
++    uint32_t offset;     // merge 之后的索引修复
++};
++
++typedef struct zns_ssd
++{
++    struct zns_ssd_params zsp;
++    struct ssd_channel *ch;
++    struct zns_maptbl *maptbl;
++    struct zns_blks_usage blks_usage;
++    QemuSpin nand_lock;
++    QemuSpin map_lock;
++} ZNS_SSD;
++
++void zns_ssd_init(FemuCtrl *n);
++void zns_ssd_rw(ZNS_SSD *zns_ssd, NvmeRequest *req);
++void zns_ssd_append(ZNS_SSD *zns_ssd, NvmeRequest *req, uint64_t zone_wp);
++void zns_ssd_async_reset(ZNS_SSD *zns_ssd, NvmeRequest *req, uint64_t slba);
++void zns_ssd_merge_zones(ZNS_SSD *zns_ssd, uint32_t zone_id, uint32_t count);
++void zns_ssd_split_zones(ZNS_SSD *zns_ssd, uint32_t zone_id);
++void zns_flip(FemuCtrl *n, NvmeCmd *cmd);
++
++// #define FEMU_DEBUG_ZNS_FTL
++#ifdef FEMU_DEBUG_ZNS_FTL
++#define zns_ftl_debug(fmt, ...)                                                                                        \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        printf("[FEMU] ZNS-FTL-Debug: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                                 \
++    } while (0)
++#else
++#define zns_ftl_debug(fmt, ...)                                                                                        \
++    do                                                                                                                 \
++    {                                                                                                                  \
++    } while (0)
++#endif
++
++#define zns_ftl_error(fmt, ...)                                                                                        \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        fprintf(stderr, "[FEMU] ZNS-FTL-Error: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                        \
++    } while (0)
++
++#define zns_ftl_log(fmt, ...)                                                                                          \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        printf("[FEMU] ZNS-FTL-Log: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                                   \
++    } while (0)
++
++#endif
+diff --git a/hw/femu/zns/zns.c b/hw/femu/zns/zns.c
+index d970c0e61..ab29b0b53 100644
+--- a/hw/femu/zns/zns.c
++++ b/hw/femu/zns/zns.c
+@@ -1,15 +1,16 @@
+ #include "./zns.h"
++#include "./zns-ftl.h"
+ 
+-#define MIN_DISCARD_GRANULARITY     (4 * KiB)
+-#define NVME_DEFAULT_ZONE_SIZE      (128 * MiB)
+-#define NVME_DEFAULT_MAX_AZ_SIZE    (128 * KiB)
++#define MIN_DISCARD_GRANULARITY (4 * KiB)
++#define NVME_DEFAULT_ZONE_SIZE (128 * MiB)
++#define NVME_DEFAULT_MAX_AZ_SIZE (128 * KiB)
+ 
+ static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
+ {
+     FemuCtrl *n = ns->ctrl;
++    uint32_t idx = n->zone_size_log2 > 0 ? slba >> n->zone_size_log2 : slba / n->zone_size;
+ 
+-    return (n->zone_size_log2 > 0 ? slba >> n->zone_size_log2 : slba /
+-            n->zone_size);
++    return idx + n->idx_offset[idx];
+ }
+ 
+ static inline NvmeZone *zns_get_zone_by_slba(NvmeNamespace *ns, uint64_t slba)
+@@ -27,52 +28,64 @@ static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
+     uint64_t zone_size, zone_cap;
+     uint32_t lbasz = 1 << zns_ns_lbads(ns);
+ 
+-    if (n->zone_size_bs) {
++    if (n->zone_size_bs)
++    {
+         zone_size = n->zone_size_bs;
+-    } else {
++    }
++    else
++    {
+         zone_size = NVME_DEFAULT_ZONE_SIZE;
+     }
+ 
+-    if (n->zone_cap_bs) {
++    if (n->zone_cap_bs)
++    {
+         zone_cap = n->zone_cap_bs;
+-    } else {
++    }
++    else
++    {
+         zone_cap = zone_size;
+     }
+ 
+-    if (zone_cap > zone_size) {
++    if (zone_cap > zone_size)
++    {
+         femu_err("zone capacity %luB > zone size %luB", zone_cap, zone_size);
+         return -1;
+     }
+-    if (zone_size < lbasz) {
++    if (zone_size < lbasz)
++    {
+         femu_err("zone size %luB too small, must >= %uB", zone_size, lbasz);
+         return -1;
+     }
+-    if (zone_cap < lbasz) {
++    if (zone_cap < lbasz)
++    {
+         femu_err("zone capacity %luB too small, must >= %uB", zone_cap, lbasz);
+         return -1;
+     }
+ 
+     n->zone_size = zone_size / lbasz;
+     n->zone_capacity = zone_cap / lbasz;
+-    n->num_zones = ns->size / lbasz / n->zone_size;
++    n->num_zones = (ns->size - n->reserved_size) / lbasz / n->zone_size;
+ 
+-    if (n->max_open_zones > n->num_zones) {
+-        femu_err("max_open_zones value %u exceeds the number of zones %u",
+-                 n->max_open_zones, n->num_zones);
++    if (n->max_open_zones > n->num_zones)
++    {
++        femu_err("max_open_zones value %u exceeds the number of zones %u", n->max_open_zones, n->num_zones);
+         return -1;
+     }
+-    if (n->max_active_zones > n->num_zones) {
+-        femu_err("max_active_zones value %u exceeds the number of zones %u",
+-                 n->max_active_zones, n->num_zones);
++    if (n->max_active_zones > n->num_zones)
++    {
++        femu_err("max_active_zones value %u exceeds the number of zones %u", n->max_active_zones, n->num_zones);
+         return -1;
+     }
+ 
+-    if (n->zd_extension_size) {
+-        if (n->zd_extension_size & 0x3f) {
++    if (n->zd_extension_size)
++    {
++        if (n->zd_extension_size & 0x3f)
++        {
+             femu_err("zone descriptor extension size must be multiples of 64B");
+             return -1;
+         }
+-        if ((n->zd_extension_size >> 6) > 0xff) {
++        if ((n->zd_extension_size >> 6) > 0xff)
++        {
+             femu_err("zone descriptor extension size is too large");
+             return -1;
+         }
+@@ -90,7 +103,9 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
+     int i;
+ 
+     n->zone_array = g_new0(NvmeZone, n->num_zones);
+-    if (n->zd_extension_size) {
++    n->idx_offset = g_malloc0(sizeof(int32_t) * n->num_zones);
++    if (n->zd_extension_size)
++    {
+         n->zd_extensions = g_malloc0(n->zd_extension_size * n->num_zones);
+     }
+ 
+@@ -100,13 +115,16 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
+     QTAILQ_INIT(&n->full_zones);
+ 
+     zone = n->zone_array;
+-    for (i = 0; i < n->num_zones; i++, zone++) {
+-        if (start + zone_size > capacity) {
++    for (i = 0; i < n->num_zones; i++, zone++)
++    {
++        if (start + zone_size > capacity)
++        {
+             zone_size = capacity - start;
+         }
+         zone->d.zt = NVME_ZONE_TYPE_SEQ_WRITE;
+         zns_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
+         zone->d.za = 0;
++        zone->d.zlen = n->zone_size;
+         zone->d.zcap = n->zone_capacity;
+         zone->d.zslba = start;
+         zone->d.wp = start;
+@@ -115,7 +133,8 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
+     }
+ 
+     n->zone_size_log2 = 0;
+-    if (is_power_of_2(n->zone_size)) {
++    if (is_power_of_2(n->zone_size))
++    {
+         n->zone_size_log2 = 63 - clz64(n->zone_size);
+     }
+ }
+@@ -150,10 +169,12 @@ static void zns_init_zone_identify(FemuCtrl *n, NvmeNamespace *ns, int lba_index
+      * we can only support DULBE if the zone size is a multiple of the
+      * calculated NPDG.
+      */
+-    if (n->zone_size % (ns->id_ns.npdg + 1)) {
+-        femu_err("the zone size (%"PRIu64" blocks) is not a multiple of the"
+-                 "calculated deallocation granularity (%"PRIu16" blocks); DULBE"
+-                 "support disabled", n->zone_size, ns->id_ns.npdg + 1);
++    if (n->zone_size % (ns->id_ns.npdg + 1))
++    {
++        femu_err("the zone size (%" PRIu64 " blocks) is not a multiple of the"
++                 "calculated deallocation granularity (%" PRIu16 " blocks); DULBE"
++                 "support disabled",
++                 n->zone_size, ns->id_ns.npdg + 1);
+         ns->id_ns.nsfeat &= ~0x4;
+     }
+ 
+@@ -167,14 +188,17 @@ static void zns_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
+ 
+     zone->w_ptr = zone->d.wp;
+     state = zns_get_zone_state(zone);
+-    if (zone->d.wp != zone->d.zslba ||
+-        (zone->d.za & NVME_ZA_ZD_EXT_VALID)) {
+-        if (state != NVME_ZONE_STATE_CLOSED) {
++    if (zone->d.wp != zone->d.zslba || (zone->d.za & NVME_ZA_ZD_EXT_VALID))
++    {
++        if (state != NVME_ZONE_STATE_CLOSED)
++        {
+             zns_set_zone_state(zone, NVME_ZONE_STATE_CLOSED);
+         }
+         zns_aor_inc_active(ns);
+         QTAILQ_INSERT_HEAD(&n->closed_zones, zone, entry);
+-    } else {
++    }
++    else
++    {
+         zns_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
+     }
+ }
+@@ -184,18 +208,21 @@ static void zns_zoned_ns_shutdown(NvmeNamespace *ns)
+     FemuCtrl *n = ns->ctrl;
+     NvmeZone *zone, *next;
+ 
+-    QTAILQ_FOREACH_SAFE(zone, &n->closed_zones, entry, next) {
++    QTAILQ_FOREACH_SAFE(zone, &n->closed_zones, entry, next)
++    {
+         QTAILQ_REMOVE(&n->closed_zones, zone, entry);
+         zns_aor_dec_active(ns);
+         zns_clear_zone(ns, zone);
+     }
+-    QTAILQ_FOREACH_SAFE(zone, &n->imp_open_zones, entry, next) {
++    QTAILQ_FOREACH_SAFE(zone, &n->imp_open_zones, entry, next)
++    {
+         QTAILQ_REMOVE(&n->imp_open_zones, zone, entry);
+         zns_aor_dec_open(ns);
+         zns_aor_dec_active(ns);
+         zns_clear_zone(ns, zone);
+     }
+-    QTAILQ_FOREACH_SAFE(zone, &n->exp_open_zones, entry, next) {
++    QTAILQ_FOREACH_SAFE(zone, &n->exp_open_zones, entry, next)
++    {
+         QTAILQ_REMOVE(&n->exp_open_zones, zone, entry);
+         zns_aor_dec_open(ns);
+         zns_aor_dec_active(ns);
+@@ -208,7 +235,8 @@ static void zns_zoned_ns_shutdown(NvmeNamespace *ns)
+ void zns_ns_shutdown(NvmeNamespace *ns)
+ {
+     FemuCtrl *n = ns->ctrl;
+-    if (n->zoned) {
++    if (n->zoned)
++    {
+         zns_zoned_ns_shutdown(ns);
+     }
+ }
+@@ -216,20 +244,22 @@ void zns_ns_shutdown(NvmeNamespace *ns)
+ void zns_ns_cleanup(NvmeNamespace *ns)
+ {
+     FemuCtrl *n = ns->ctrl;
+-    if (n->zoned) {
++    if (n->zoned)
++    {
+         g_free(n->id_ns_zoned);
+         g_free(n->zone_array);
+         g_free(n->zd_extensions);
+     }
+ }
+ 
+-static void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone,
+-                                  NvmeZoneState state)
++static void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state)
+ {
+     FemuCtrl *n = ns->ctrl;
+ 
+-    if (QTAILQ_IN_USE(zone, entry)) {
+-        switch (zns_get_zone_state(zone)) {
++    if (QTAILQ_IN_USE(zone, entry))
++    {
++        switch (zns_get_zone_state(zone))
++        {
+         case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+             QTAILQ_REMOVE(&n->exp_open_zones, zone, entry);
+             break;
+@@ -241,14 +271,14 @@ static void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone,
+             break;
+         case NVME_ZONE_STATE_FULL:
+             QTAILQ_REMOVE(&n->full_zones, zone, entry);
+-        default:
+-            ;
++        default:;
+         }
+     }
+ 
+     zns_set_zone_state(zone, state);
+ 
+-    switch (state) {
++    switch (state)
++    {
+     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+         QTAILQ_INSERT_TAIL(&n->exp_open_zones, zone, entry);
+         break;
+@@ -267,30 +297,12 @@ static void zns_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone,
+     }
+ }
+ 
+-/*
+- * Check if we can open a zone without exceeding open/active limits.
+- * AOR stands for "Active and Open Resources" (see TP 4053 section 2.5).
+- */
+-static int zns_aor_check(NvmeNamespace *ns, uint32_t act, uint32_t opn)
+-{
+-    FemuCtrl *n = ns->ctrl;
+-    if (n->max_active_zones != 0 &&
+-        n->nr_active_zones + act > n->max_active_zones) {
+-        return NVME_ZONE_TOO_MANY_ACTIVE | NVME_DNR;
+-    }
+-    if (n->max_open_zones != 0 &&
+-        n->nr_open_zones + opn > n->max_open_zones) {
+-        return NVME_ZONE_TOO_MANY_OPEN | NVME_DNR;
+-    }
+-
+-    return NVME_SUCCESS;
+-}
+-
+ static uint16_t zns_check_zone_state_for_write(NvmeZone *zone)
+ {
+     uint16_t status;
+ 
+-    switch (zns_get_zone_state(zone)) {
++    switch (zns_get_zone_state(zone))
++    {
+     case NVME_ZONE_STATE_EMPTY:
+     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
+     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+@@ -313,29 +325,39 @@ static uint16_t zns_check_zone_state_for_write(NvmeZone *zone)
+     return status;
+ }
+ 
+-static uint16_t zns_check_zone_write(FemuCtrl *n, NvmeNamespace *ns,
+-                                      NvmeZone *zone, uint64_t slba,
+-                                      uint32_t nlb, bool append)
++static uint16_t zns_check_zone_write(FemuCtrl *n, NvmeNamespace *ns, NvmeZone *zone, uint64_t slba, uint32_t nlb,
++                                     bool append)
+ {
+     uint16_t status;
+ 
+-    if (unlikely((slba + nlb) > zns_zone_wr_boundary(zone))) {
++    if (unlikely((slba + nlb) > zns_zone_wr_boundary(zone)))
++    {
+         status = NVME_ZONE_BOUNDARY_ERROR;
+-    } else {
++    }
++    else
++    {
+         status = zns_check_zone_state_for_write(zone);
+     }
+ 
+-    if (status != NVME_SUCCESS) {
+-    } else {
++    if (status != NVME_SUCCESS)
++    {
++    }
++    else
++    {
+         assert(zns_wp_is_valid(zone));
+-        if (append) {
+-            if (unlikely(slba != zone->d.zslba)) {
++        if (append)
++        {
++            if (unlikely(slba != zone->d.zslba))
++            {
+                 status = NVME_INVALID_FIELD;
+             }
+-            if (zns_l2b(ns, nlb) > (n->page_size << n->zasl)) {
++            if (zns_l2b(ns, nlb) > (n->page_size << n->zasl))
++            {
+                 status = NVME_INVALID_FIELD;
+             }
+-        } else if (unlikely(slba != zone->w_ptr)) {
++        }
++        else if (unlikely(slba != zone->w_ptr))
++        {
+             status = NVME_ZONE_INVALID_WRITE;
+         }
+     }
+@@ -347,7 +369,8 @@ static uint16_t zns_check_zone_state_for_read(NvmeZone *zone)
+ {
+     uint16_t status;
+ 
+-    switch (zns_get_zone_state(zone)) {
++    switch (zns_get_zone_state(zone))
++    {
+     case NVME_ZONE_STATE_EMPTY:
+     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
+     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+@@ -366,8 +389,7 @@ static uint16_t zns_check_zone_state_for_read(NvmeZone *zone)
+     return status;
+ }
+ 
+-static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba,
+-                                    uint32_t nlb)
++static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
+ {
+     FemuCtrl *n = ns->ctrl;
+     NvmeZone *zone = zns_get_zone_by_slba(ns, slba);
+@@ -376,20 +398,28 @@ static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba,
+     uint16_t status;
+ 
+     status = zns_check_zone_state_for_read(zone);
+-    if (status != NVME_SUCCESS) {
++    if (status != NVME_SUCCESS)
++    {
+         ;
+-    } else if (unlikely(end > bndry)) {
+-        if (!n->cross_zone_read) {
++    }
++    else if (unlikely(end > bndry))
++    {
++        if (!n->cross_zone_read)
++        {
+             status = NVME_ZONE_BOUNDARY_ERROR;
+-        } else {
++        }
++        else
++        {
+             /*
+              * Read across zone boundary - check that all subsequent
+              * zones that are being read have an appropriate state.
+              */
+-            do {
++            do
++            {
+                 zone++;
+                 status = zns_check_zone_state_for_read(zone);
+-                if (status != NVME_SUCCESS) {
++                if (status != NVME_SUCCESS)
++                {
+                     break;
+                 }
+             } while (end > zns_zone_rd_boundary(ns, zone));
+@@ -404,11 +434,12 @@ static void zns_auto_transition_zone(NvmeNamespace *ns)
+     FemuCtrl *n = ns->ctrl;
+     NvmeZone *zone;
+ 
+-    if (n->max_open_zones &&
+-        n->nr_open_zones == n->max_open_zones) {
++    if (n->max_open_zones && n->nr_open_zones == n->max_open_zones)
++    {
+         zone = QTAILQ_FIRST(&n->imp_open_zones);
+-        if (zone) {
+-             /* Automatically close this implicitly open zone */
++        if (zone)
++        {
++            /* Automatically close this implicitly open zone */
+             QTAILQ_REMOVE(&n->imp_open_zones, zone, entry);
+             zns_aor_dec_open(ns);
+             zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_CLOSED);
+@@ -419,21 +450,36 @@ static void zns_auto_transition_zone(NvmeNamespace *ns)
+ static uint16_t zns_auto_open_zone(NvmeNamespace *ns, NvmeZone *zone)
+ {
+     uint16_t status = NVME_SUCCESS;
+-    uint8_t zs = zns_get_zone_state(zone);
++    uint8_t state = zns_get_zone_state(zone);
+ 
+-    if (zs == NVME_ZONE_STATE_EMPTY) {
+-        zns_auto_transition_zone(ns);
+-        status = zns_aor_check(ns, 1, 1);
+-    } else if (zs == NVME_ZONE_STATE_CLOSED) {
+-        zns_auto_transition_zone(ns);
+-        status = zns_aor_check(ns, 0, 1);
++    zns_auto_transition_zone(ns);
++
++    switch (state)
++    {
++    case NVME_ZONE_STATE_EMPTY:
++        status = zns_aor_inc_active(ns);
++        if (status != NVME_SUCCESS)
++        {
++            return status;
++        }
++        /* fall through */
++    case NVME_ZONE_STATE_CLOSED:
++        status = zns_aor_inc_open(ns);
++        if (status != NVME_SUCCESS)
++        {
++            if (state == NVME_ZONE_STATE_EMPTY)
++            {
++                zns_aor_dec_active(ns);
++            }
++            return status;
++        }
++        zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_IMPLICITLY_OPEN);
+     }
+ 
+     return status;
+ }
+ 
+-static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req,
+-                                     bool failed)
++static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req, bool failed)
+ {
+     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+     NvmeZone *zone;
+@@ -447,12 +493,15 @@ static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req,
+ 
+     zone->d.wp += nlb;
+ 
+-    if (failed) {
++    if (failed)
++    {
+         res->slba = 0;
+     }
+ 
+-    if (zone->d.wp == zns_zone_wr_boundary(zone)) {
+-        switch (zns_get_zone_state(zone)) {
++    if (zone->d.wp == zns_zone_wr_boundary(zone))
++    {
++        switch (zns_get_zone_state(zone))
++        {
+         case NVME_ZONE_STATE_IMPLICITLY_OPEN:
+         case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+             zns_aor_dec_open(ns);
+@@ -471,32 +520,19 @@ static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req,
+     }
+ }
+ 
+-static uint64_t zns_advance_zone_wp(NvmeNamespace *ns, NvmeZone *zone,
+-                                    uint32_t nlb)
++static uint64_t zns_advance_zone_wp(NvmeNamespace *ns, NvmeZone *zone, uint32_t nlb)
+ {
+     uint64_t result = zone->w_ptr;
+-    uint8_t zs;
+ 
+     zone->w_ptr += nlb;
+ 
+-    if (zone->w_ptr < zns_zone_wr_boundary(zone)) {
+-        zs = zns_get_zone_state(zone);
+-        switch (zs) {
+-        case NVME_ZONE_STATE_EMPTY:
+-            zns_aor_inc_active(ns);
+-            /* fall through */
+-        case NVME_ZONE_STATE_CLOSED:
+-            zns_aor_inc_open(ns);
+-            zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_IMPLICITLY_OPEN);
+-        }
+-    }
+-
+     return result;
+ }
+ 
+-struct zns_zone_reset_ctx {
++struct zns_zone_reset_ctx
++{
+     NvmeRequest *req;
+-    NvmeZone    *zone;
++    NvmeZone *zone;
+ };
+ 
+ static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
+@@ -504,7 +540,8 @@ static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
+     NvmeNamespace *ns = req->ns;
+ 
+     /* FIXME, We always assume reset SUCCESS */
+-    switch (zns_get_zone_state(zone)) {
++    switch (zns_get_zone_state(zone))
++    {
+     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+         /* fall through */
+     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
+@@ -522,39 +559,40 @@ static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
+     }
+ }
+ 
+-typedef uint16_t (*op_handler_t)(NvmeNamespace *, NvmeZone *, NvmeZoneState,
+-                                 NvmeRequest *);
++typedef uint16_t (*op_handler_t)(NvmeNamespace *, NvmeZone *, NvmeZoneState, NvmeRequest *);
+ 
+-enum NvmeZoneProcessingMask {
+-    NVME_PROC_CURRENT_ZONE    = 0,
+-    NVME_PROC_OPENED_ZONES    = 1 << 0,
+-    NVME_PROC_CLOSED_ZONES    = 1 << 1,
++enum NvmeZoneProcessingMask
++{
++    NVME_PROC_CURRENT_ZONE = 0,
++    NVME_PROC_OPENED_ZONES = 1 << 0,
++    NVME_PROC_CLOSED_ZONES = 1 << 1,
+     NVME_PROC_READ_ONLY_ZONES = 1 << 2,
+-    NVME_PROC_FULL_ZONES      = 1 << 3,
++    NVME_PROC_FULL_ZONES = 1 << 3,
+ };
+ 
+-static uint16_t zns_open_zone(NvmeNamespace *ns, NvmeZone *zone,
+-                              NvmeZoneState state, NvmeRequest *req)
++static uint16_t zns_open_zone(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state, NvmeRequest *req)
+ {
+     uint16_t status;
+ 
+-    switch (state) {
++    switch (state)
++    {
+     case NVME_ZONE_STATE_EMPTY:
+-        status = zns_aor_check(ns, 1, 0);
+-        if (status != NVME_SUCCESS) {
++        status = zns_aor_inc_active(ns);
++        if (status != NVME_SUCCESS)
++        {
+             return status;
+         }
+-        zns_aor_inc_active(ns);
+         /* fall through */
+     case NVME_ZONE_STATE_CLOSED:
+-        status = zns_aor_check(ns, 0, 1);
+-        if (status != NVME_SUCCESS) {
+-            if (state == NVME_ZONE_STATE_EMPTY) {
++        status = zns_aor_inc_open(ns);
++        if (status != NVME_SUCCESS)
++        {
++            if (state == NVME_ZONE_STATE_EMPTY)
++            {
+                 zns_aor_dec_active(ns);
+             }
+             return status;
+         }
+-        zns_aor_inc_open(ns);
+         /* fall through */
+     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
+         zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_EXPLICITLY_OPEN);
+@@ -566,10 +604,10 @@ static uint16_t zns_open_zone(NvmeNamespace *ns, NvmeZone *zone,
+     }
+ }
+ 
+-static uint16_t zns_close_zone(NvmeNamespace *ns, NvmeZone *zone,
+-                               NvmeZoneState state, NvmeRequest *req)
++static uint16_t zns_close_zone(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state, NvmeRequest *req)
+ {
+-    switch (state) {
++    switch (state)
++    {
+     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+         /* fall through */
+     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
+@@ -583,10 +621,10 @@ static uint16_t zns_close_zone(NvmeNamespace *ns, NvmeZone *zone,
+     }
+ }
+ 
+-static uint16_t zns_finish_zone(NvmeNamespace *ns, NvmeZone *zone,
+-                                NvmeZoneState state, NvmeRequest *req)
++static uint16_t zns_finish_zone(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state, NvmeRequest *req)
+ {
+-    switch (state) {
++    switch (state)
++    {
+     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+         /* fall through */
+     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
+@@ -607,10 +645,10 @@ static uint16_t zns_finish_zone(NvmeNamespace *ns, NvmeZone *zone,
+     }
+ }
+ 
+-static uint16_t zns_reset_zone(NvmeNamespace *ns, NvmeZone *zone,
+-                               NvmeZoneState state, NvmeRequest *req)
++static uint16_t zns_reset_zone(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state, NvmeRequest *req)
+ {
+-    switch (state) {
++    switch (state)
++    {
+     case NVME_ZONE_STATE_EMPTY:
+         return NVME_SUCCESS;
+     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+@@ -623,14 +661,15 @@ static uint16_t zns_reset_zone(NvmeNamespace *ns, NvmeZone *zone,
+     }
+ 
+     zns_aio_zone_reset_cb(req, zone);
++    zns_ssd_async_reset(ns->ctrl->zns_ssd, req, zone->d.zslba);
+ 
+     return NVME_SUCCESS;
+ }
+ 
+-static uint16_t zns_offline_zone(NvmeNamespace *ns, NvmeZone *zone,
+-                                 NvmeZoneState state, NvmeRequest *req)
++static uint16_t zns_offline_zone(NvmeNamespace *ns, NvmeZone *zone, NvmeZoneState state, NvmeRequest *req)
+ {
+-    switch (state) {
++    switch (state)
++    {
+     case NVME_ZONE_STATE_READ_ONLY:
+         zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_OFFLINE);
+         /* fall through */
+@@ -646,12 +685,13 @@ static uint16_t zns_set_zd_ext(NvmeNamespace *ns, NvmeZone *zone)
+     uint16_t status;
+     uint8_t state = zns_get_zone_state(zone);
+ 
+-    if (state == NVME_ZONE_STATE_EMPTY) {
+-        status = zns_aor_check(ns, 1, 0);
+-        if (status != NVME_SUCCESS) {
++    if (state == NVME_ZONE_STATE_EMPTY)
++    {
++        status = zns_aor_inc_active(ns);
++        if (status != NVME_SUCCESS)
++        {
+             return status;
+         }
+-        zns_aor_inc_active(ns);
+         zone->d.za |= NVME_ZA_ZD_EXT_VALID;
+         zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_CLOSED);
+         return NVME_SUCCESS;
+@@ -660,15 +700,15 @@ static uint16_t zns_set_zd_ext(NvmeNamespace *ns, NvmeZone *zone)
+     return NVME_ZONE_INVAL_TRANSITION;
+ }
+ 
+-static uint16_t zns_bulk_proc_zone(NvmeNamespace *ns, NvmeZone *zone,
+-                                   enum NvmeZoneProcessingMask proc_mask,
++static uint16_t zns_bulk_proc_zone(NvmeNamespace *ns, NvmeZone *zone, enum NvmeZoneProcessingMask proc_mask,
+                                    op_handler_t op_hndlr, NvmeRequest *req)
+ {
+     uint16_t status = NVME_SUCCESS;
+     NvmeZoneState zs = zns_get_zone_state(zone);
+     bool proc_zone;
+ 
+-    switch (zs) {
++    switch (zs)
++    {
+     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
+     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
+         proc_zone = proc_mask & NVME_PROC_OPENED_ZONES;
+@@ -686,15 +726,15 @@ static uint16_t zns_bulk_proc_zone(NvmeNamespace *ns, NvmeZone *zone,
+         proc_zone = false;
+     }
+ 
+-    if (proc_zone) {
++    if (proc_zone)
++    {
+         status = op_hndlr(ns, zone, zs, req);
+     }
+ 
+     return status;
+ }
+ 
+-static uint16_t zns_do_zone_op(NvmeNamespace *ns, NvmeZone *zone,
+-                               enum NvmeZoneProcessingMask proc_mask,
++static uint16_t zns_do_zone_op(NvmeNamespace *ns, NvmeZone *zone, enum NvmeZoneProcessingMask proc_mask,
+                                op_handler_t op_hndlr, NvmeRequest *req)
+ {
+     FemuCtrl *n = ns->ctrl;
+@@ -702,50 +742,62 @@ static uint16_t zns_do_zone_op(NvmeNamespace *ns, NvmeZone *zone,
+     uint16_t status = NVME_SUCCESS;
+     int i;
+ 
+-    if (!proc_mask) {
++    if (!proc_mask)
++    {
+         status = op_hndlr(ns, zone, zns_get_zone_state(zone), req);
+-    } else {
+-        if (proc_mask & NVME_PROC_CLOSED_ZONES) {
+-            QTAILQ_FOREACH_SAFE(zone, &n->closed_zones, entry, next) {
+-                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr,
+-                                             req);
+-                if (status && status != NVME_NO_COMPLETE) {
++    }
++    else
++    {
++        if (proc_mask & NVME_PROC_CLOSED_ZONES)
++        {
++            QTAILQ_FOREACH_SAFE(zone, &n->closed_zones, entry, next)
++            {
++                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr, req);
++                if (status && status != NVME_NO_COMPLETE)
++                {
+                     goto out;
+                 }
+             }
+         }
+-        if (proc_mask & NVME_PROC_OPENED_ZONES) {
+-            QTAILQ_FOREACH_SAFE(zone, &n->imp_open_zones, entry, next) {
+-                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr,
+-                                             req);
+-                if (status && status != NVME_NO_COMPLETE) {
++        if (proc_mask & NVME_PROC_OPENED_ZONES)
++        {
++            QTAILQ_FOREACH_SAFE(zone, &n->imp_open_zones, entry, next)
++            {
++                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr, req);
++                if (status && status != NVME_NO_COMPLETE)
++                {
+                     goto out;
+                 }
+             }
+ 
+-            QTAILQ_FOREACH_SAFE(zone, &n->exp_open_zones, entry, next) {
+-                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr,
+-                                             req);
+-                if (status && status != NVME_NO_COMPLETE) {
++            QTAILQ_FOREACH_SAFE(zone, &n->exp_open_zones, entry, next)
++            {
++                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr, req);
++                if (status && status != NVME_NO_COMPLETE)
++                {
+                     goto out;
+                 }
+             }
+         }
+-        if (proc_mask & NVME_PROC_FULL_ZONES) {
+-            QTAILQ_FOREACH_SAFE(zone, &n->full_zones, entry, next) {
+-                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr,
+-                                             req);
+-                if (status && status != NVME_NO_COMPLETE) {
++        if (proc_mask & NVME_PROC_FULL_ZONES)
++        {
++            QTAILQ_FOREACH_SAFE(zone, &n->full_zones, entry, next)
++            {
++                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr, req);
++                if (status && status != NVME_NO_COMPLETE)
++                {
+                     goto out;
+                 }
+             }
+         }
+ 
+-        if (proc_mask & NVME_PROC_READ_ONLY_ZONES) {
+-            for (i = 0; i < n->num_zones; i++, zone++) {
+-                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr,
+-                                             req);
+-                if (status && status != NVME_NO_COMPLETE) {
++        if (proc_mask & NVME_PROC_READ_ONLY_ZONES)
++        {
++            for (i = 0; i < n->num_zones; i++, zone++)
++            {
++                status = zns_bulk_proc_zone(ns, zone, proc_mask, op_hndlr, req);
++                if (status && status != NVME_NO_COMPLETE)
++                {
+                     goto out;
+                 }
+             }
+@@ -756,19 +808,20 @@ out:
+     return status;
+ }
+ 
+-static uint16_t zns_get_mgmt_zone_slba_idx(FemuCtrl *n, NvmeCmd *c,
+-                                           uint64_t *slba, uint32_t *zone_idx)
++static uint16_t zns_get_mgmt_zone_slba_idx(FemuCtrl *n, NvmeCmd *c, uint64_t *slba, uint32_t *zone_idx)
+ {
+     NvmeNamespace *ns = &n->namespaces[0];
+     uint32_t dw10 = le32_to_cpu(c->cdw10);
+     uint32_t dw11 = le32_to_cpu(c->cdw11);
+ 
+-    if (!n->zoned) {
++    if (!n->zoned)
++    {
+         return NVME_INVALID_OPCODE | NVME_DNR;
+     }
+ 
+     *slba = ((uint64_t)dw11) << 32 | dw10;
+-    if (unlikely(*slba >= ns->id_ns.nsze)) {
++    if (unlikely(*slba >= ns->id_ns.nsze))
++    {
+         *slba = 0;
+         return NVME_LBA_RANGE | NVME_DNR;
+     }
+@@ -779,6 +832,51 @@ static uint16_t zns_get_mgmt_zone_slba_idx(FemuCtrl *n, NvmeCmd *c,
+     return NVME_SUCCESS;
+ }
+ 
++static uint16_t zns_merge_zones(FemuCtrl *n, uint32_t zone_idx, uint32_t count)
++{
++    uint32_t i = 1;
++    NvmeZone *zone = &n->zone_array[zone_idx];
++    zone->d.zlen = n->zone_size * count;
++    zone->d.zcap = zone->d.zlen - (n->zone_size - n->zone_capacity);
++
++    for (; i < count; i++)
++    {
++        zone = &n->zone_array[zone_idx + i];
++        n->idx_offset[zone_idx + i] = -i;
++        zns_set_zone_state(zone, NVME_ZONE_STATE_MERGE);
++    }
++
++    zns_ssd_merge_zones(n->zns_ssd, zone_idx, count);
++    zns_debug("Merge Zone[%d~%d]\n", zone_idx, zone_idx + count - 1);
++    return NVME_SUCCESS;
++}
++
++static uint16_t zns_split_zones(FemuCtrl *n, uint32_t zone_idx)
++{
++    uint32_t i = 1;
++    NvmeZone *zone = &n->zone_array[zone_idx];
++    zone->d.zlen = n->zone_size;
++    zone->d.zcap = n->zone_capacity;
++
++    for (; zone_idx + i < n->num_zones; i++)
++    {
++        zone = &n->zone_array[zone_idx + i];
++        if (n->idx_offset[zone_idx + i] == -i)
++        {
++            n->idx_offset[zone_idx + i] = 0;
++            zns_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
++        }
++        else
++        {
++            break;
++        }
++    }
++
++    zns_ssd_split_zones(n->zns_ssd, zone_idx);
++    zns_debug("Split Zone[%d~%d]\n", zone_idx, zone_idx + i - 1);
++    return NVME_SUCCESS;
++}
++
+ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
+ {
+     NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
+@@ -801,33 +899,45 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
+ 
+     req->status = NVME_SUCCESS;
+ 
+-    if (!all) {
++    if (!all)
++    {
+         status = zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &zone_idx);
+-        if (status) {
++        if (status)
++        {
+             return status;
+         }
+     }
+ 
+     zone = &n->zone_array[zone_idx];
+-    if (slba != zone->d.zslba) {
++    if (slba != zone->d.zslba)
++    {
++        if (slba == zone->d.zslba - n->zone_size * n->idx_offset[slba / n->zone_size])
++        {
++            // FIXME: 应该修改内核，按照新 zone size 发送命令
++            return NVME_SUCCESS;
++        }
+         return NVME_INVALID_FIELD | NVME_DNR;
+     }
+ 
+-    switch (action) {
++    switch (action)
++    {
+     case NVME_ZONE_ACTION_OPEN:
+-        if (all) {
++        if (all)
++        {
+             proc_mask = NVME_PROC_CLOSED_ZONES;
+         }
+         status = zns_do_zone_op(ns, zone, proc_mask, zns_open_zone, req);
+         break;
+     case NVME_ZONE_ACTION_CLOSE:
+-        if (all) {
++        if (all)
++        {
+             proc_mask = NVME_PROC_OPENED_ZONES;
+         }
+         status = zns_do_zone_op(ns, zone, proc_mask, zns_close_zone, req);
+         break;
+     case NVME_ZONE_ACTION_FINISH:
+-        if (all) {
++        if (all)
++        {
+             proc_mask = NVME_PROC_OPENED_ZONES | NVME_PROC_CLOSED_ZONES;
+         }
+         status = zns_do_zone_op(ns, zone, proc_mask, zns_finish_zone, req);
+@@ -835,32 +945,44 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
+     case NVME_ZONE_ACTION_RESET:
+         resets = (uintptr_t *)&req->opaque;
+ 
+-        if (all) {
+-            proc_mask = NVME_PROC_OPENED_ZONES | NVME_PROC_CLOSED_ZONES |
+-                NVME_PROC_FULL_ZONES;
++        if (all)
++        {
++            proc_mask = NVME_PROC_OPENED_ZONES | NVME_PROC_CLOSED_ZONES | NVME_PROC_FULL_ZONES;
+         }
+         *resets = 1;
+         status = zns_do_zone_op(ns, zone, proc_mask, zns_reset_zone, req);
+         (*resets)--;
+         return NVME_SUCCESS;
+     case NVME_ZONE_ACTION_OFFLINE:
+-        if (all) {
++        if (all)
++        {
+             proc_mask = NVME_PROC_READ_ONLY_ZONES;
+         }
+         status = zns_do_zone_op(ns, zone, proc_mask, zns_offline_zone, req);
+         break;
++    case NVME_ZONE_ACTION_MERGE:
++        // dw10,dw11: slba
++        // dw12: count
++        // dw13: all + opcode
++        status = zns_merge_zones(n, zone_idx, le32_to_cpu(cmd->cdw12));
++        break;
++    case NVME_ZONE_ACTION_SPLIT:
++        status = zns_split_zones(n, zone_idx);
++        break;
+     case NVME_ZONE_ACTION_SET_ZD_EXT:
+-        if (all || !n->zd_extension_size) {
++        if (all || !n->zd_extension_size)
++        {
+             return NVME_INVALID_FIELD | NVME_DNR;
+         }
+         zd_ext = zns_get_zd_extension(ns, zone_idx);
+-        status = dma_write_prp(n, (uint8_t *)zd_ext, n->zd_extension_size, prp1,
+-                               prp2);
+-        if (status) {
++        status = dma_write_prp(n, (uint8_t *)zd_ext, n->zd_extension_size, prp1, prp2);
++        if (status)
++        {
+             return status;
+         }
+         status = zns_set_zd_ext(ns, zone);
+-        if (status == NVME_SUCCESS) {
++        if (status == NVME_SUCCESS)
++        {
+             return status;
+         }
+         break;
+@@ -868,7 +990,8 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
+         status = NVME_INVALID_FIELD;
+     }
+ 
+-    if (status) {
++    if (status)
++    {
+         status |= NVME_DNR;
+     }
+ 
+@@ -879,9 +1002,10 @@ static bool zns_zone_matches_filter(uint32_t zafs, NvmeZone *zl)
+ {
+     NvmeZoneState zs = zns_get_zone_state(zl);
+ 
+-    switch (zafs) {
++    switch (zafs)
++    {
+     case NVME_ZONE_REPORT_ALL:
+-        return true;
++        return zs != NVME_ZONE_STATE_MERGE;
+     case NVME_ZONE_REPORT_EMPTY:
+         return zs == NVME_ZONE_STATE_EMPTY;
+     case NVME_ZONE_REPORT_IMPLICITLY_OPEN:
+@@ -923,84 +1047,88 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
+     req->status = NVME_SUCCESS;
+ 
+     status = zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &zone_idx);
+-    if (status) {
++    if (status)
++    {
+         return status;
+     }
+ 
+     zra = dw13 & 0xff;
+-    if (zra != NVME_ZONE_REPORT && zra != NVME_ZONE_REPORT_EXTENDED) {
++    if (zra != NVME_ZONE_REPORT && zra != NVME_ZONE_REPORT_EXTENDED)
++    {
+         return NVME_INVALID_FIELD | NVME_DNR;
+     }
+-    if (zra == NVME_ZONE_REPORT_EXTENDED && !n->zd_extension_size) {
++    if (zra == NVME_ZONE_REPORT_EXTENDED && !n->zd_extension_size)
++    {
+         return NVME_INVALID_FIELD | NVME_DNR;
+     }
+ 
+     zrasf = (dw13 >> 8) & 0xff;
+-    if (zrasf > NVME_ZONE_REPORT_OFFLINE) {
++    if (zrasf > NVME_ZONE_REPORT_OFFLINE)
++    {
+         return NVME_INVALID_FIELD | NVME_DNR;
+     }
+ 
+-    if (data_size < sizeof(NvmeZoneReportHeader)) {
++    if (data_size < sizeof(NvmeZoneReportHeader))
++    {
+         return NVME_INVALID_FIELD | NVME_DNR;
+     }
+ 
+     status = nvme_check_mdts(n, data_size);
+-    if (status) {
++    if (status)
++    {
+         return status;
+     }
+ 
+     partial = (dw13 >> 16) & 0x01;
+ 
+     zone_entry_sz = sizeof(NvmeZoneDescr);
+-    if (zra == NVME_ZONE_REPORT_EXTENDED) {
++    if (zra == NVME_ZONE_REPORT_EXTENDED)
++    {
+         zone_entry_sz += n->zd_extension_size;
+     }
+ 
+     max_zones = (data_size - sizeof(NvmeZoneReportHeader)) / zone_entry_sz;
+     buf = g_malloc0(data_size);
+-
+-    zone = &n->zone_array[zone_idx];
+-    for (; slba < capacity; slba += n->zone_size) {
+-        if (partial && nr_zones >= max_zones) {
+-            break;
+-        }
+-        if (zns_zone_matches_filter(zrasf, zone++)) {
+-            nr_zones++;
+-        }
+-    }
+     header = (NvmeZoneReportHeader *)buf;
+-    header->nr_zones = cpu_to_le64(nr_zones);
+-
+     buf_p = buf + sizeof(NvmeZoneReportHeader);
+-    for (; zone_idx < n->num_zones && max_zones > 0; zone_idx++) {
++    for (; zone_idx < n->num_zones && max_zones > 0; zone_idx++)
++    {
+         zone = &n->zone_array[zone_idx];
+-        if (zns_zone_matches_filter(zrasf, zone)) {
++        if (zns_zone_matches_filter(zrasf, zone))
++        {
+             z = (NvmeZoneDescr *)buf_p;
+             buf_p += sizeof(NvmeZoneDescr);
+ 
+             z->zt = zone->d.zt;
+             z->zs = zone->d.zs;
++            z->zlen = cpu_to_le64(zone->d.zlen);
+             z->zcap = cpu_to_le64(zone->d.zcap);
+             z->zslba = cpu_to_le64(zone->d.zslba);
+             z->za = zone->d.za;
+ 
+-            if (zns_wp_is_valid(zone)) {
++            if (zns_wp_is_valid(zone))
++            {
+                 z->wp = cpu_to_le64(zone->d.wp);
+-            } else {
++            }
++            else
++            {
+                 z->wp = cpu_to_le64(~0ULL);
+             }
+ 
+-            if (zra == NVME_ZONE_REPORT_EXTENDED) {
+-                if (zone->d.za & NVME_ZA_ZD_EXT_VALID) {
+-                    memcpy(buf_p, zns_get_zd_extension(ns, zone_idx),
+-                           n->zd_extension_size);
++            if (zra == NVME_ZONE_REPORT_EXTENDED)
++            {
++                if (zone->d.za & NVME_ZA_ZD_EXT_VALID)
++                {
++                    memcpy(buf_p, zns_get_zd_extension(ns, zone_idx), n->zd_extension_size);
+                 }
+                 buf_p += n->zd_extension_size;
+             }
+ 
++            nr_zones++;
+             max_zones--;
+         }
+     }
++    header->nr_zones = cpu_to_le64(nr_zones);
+ 
+     status = dma_read_prp(n, (uint8_t *)buf, data_size, prp1, prp2);
+ 
+@@ -1011,7 +1139,8 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
+ 
+ static inline bool nvme_csi_has_nvm_support(NvmeNamespace *ns)
+ {
+-    switch (ns->ctrl->csi) {
++    switch (ns->ctrl->csi)
++    {
+     case NVME_CSI_NVM:
+     case NVME_CSI_ZONED:
+         return true;
+@@ -1019,12 +1148,12 @@ static inline bool nvme_csi_has_nvm_support(NvmeNamespace *ns)
+     return false;
+ }
+ 
+-static inline uint16_t zns_check_bounds(NvmeNamespace *ns, uint64_t slba,
+-                                        uint32_t nlb)
++static inline uint16_t zns_check_bounds(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
+ {
+     uint64_t nsze = le64_to_cpu(ns->id_ns.nsze);
+ 
+-    if (unlikely(UINT64_MAX - slba < nlb || slba + nlb > nsze)) {
++    if (unlikely(UINT64_MAX - slba < nlb || slba + nlb > nsze))
++    {
+         return NVME_LBA_RANGE | NVME_DNR;
+     }
+ 
+@@ -1035,7 +1164,8 @@ static uint16_t zns_map_dptr(FemuCtrl *n, size_t len, NvmeRequest *req)
+ {
+     uint64_t prp1, prp2;
+ 
+-    switch (req->cmd.psdt) {
++    switch (req->cmd.psdt)
++    {
+     case NVME_PSDT_PRP:
+         prp1 = le64_to_cpu(req->cmd.dptr.prp1);
+         prp2 = le64_to_cpu(req->cmd.dptr.prp2);
+@@ -1046,8 +1176,7 @@ static uint16_t zns_map_dptr(FemuCtrl *n, size_t len, NvmeRequest *req)
+     }
+ }
+ 
+-static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
+-                             bool wrz)
++static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append, bool wrz)
+ {
+     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+     NvmeNamespace *ns = req->ns;
+@@ -1059,31 +1188,37 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
+     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
+     uint16_t status;
+ 
+-    if (!wrz) {
++    if (!wrz)
++    {
+         status = nvme_check_mdts(n, data_size);
+-        if (status) {
++        if (status)
++        {
+             goto err;
+         }
+     }
+ 
+     status = zns_check_bounds(ns, slba, nlb);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     zone = zns_get_zone_by_slba(ns, slba);
+ 
+     status = zns_check_zone_write(n, ns, zone, slba, nlb, append);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     status = zns_auto_open_zone(ns, zone);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+-    if (append) {
++    if (append)
++    {
+         slba = zone->w_ptr;
+     }
+ 
+@@ -1091,13 +1226,16 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
+ 
+     data_offset = zns_l2b(ns, slba);
+ 
+-    if (!wrz) {
++    if (!wrz)
++    {
+         status = zns_map_dptr(n, data_size, req);
+-        if (status) {
++        if (status)
++        {
+             goto err;
+         }
+ 
+         backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
++        zns_ssd_append(n->zns_ssd, req, slba);
+     }
+ 
+     zns_finalize_zoned_write(ns, req, false);
+@@ -1110,7 +1248,11 @@ err:
+ 
+ static uint16_t zns_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
+ {
+-    switch (cmd->opcode) {
++    switch (cmd->opcode)
++    {
++    case NVME_ADM_CMD_FEMU_FLIP:
++        zns_flip(n, cmd);
++        return NVME_SUCCESS;
+     default:
+         return NVME_INVALID_OPCODE | NVME_DNR;
+     }
+@@ -1126,8 +1268,7 @@ static uint16_t zns_check_dulbe(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
+     return NVME_SUCCESS;
+ }
+ 
+-static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+-                         NvmeRequest *req)
++static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
+ {
+     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+     uint64_t slba = le64_to_cpu(rw->slba);
+@@ -1140,28 +1281,34 @@ static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     req->is_write = false;
+ 
+     status = nvme_check_mdts(n, data_size);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     status = zns_check_bounds(ns, slba, nlb);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     status = zns_check_zone_read(ns, slba, nlb);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     status = zns_map_dptr(n, data_size, req);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+-    if (NVME_ERR_REC_DULBE(n->features.err_rec)) {
++    if (NVME_ERR_REC_DULBE(n->features.err_rec))
++    {
+         status = zns_check_dulbe(ns, slba, nlb);
+-        if (status) {
++        if (status)
++        {
+             goto err;
+         }
+     }
+@@ -1169,14 +1316,15 @@ static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     data_offset = zns_l2b(ns, slba);
+ 
+     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
++    zns_ssd_rw(n->zns_ssd, req);
++
+     return NVME_SUCCESS;
+ 
+ err:
+     return status | NVME_DNR;
+ }
+ 
+-static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+-                          NvmeRequest *req)
++static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
+ {
+     NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
+     uint64_t slba = le64_to_cpu(rw->slba);
+@@ -1191,24 +1339,28 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     req->is_write = true;
+ 
+     status = nvme_check_mdts(n, data_size);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     status = zns_check_bounds(ns, slba, nlb);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     zone = zns_get_zone_by_slba(ns, slba);
+ 
+     status = zns_check_zone_write(n, ns, zone, slba, nlb, false);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     status = zns_auto_open_zone(ns, zone);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+@@ -1217,11 +1369,13 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     data_offset = zns_l2b(ns, slba);
+ 
+     status = zns_map_dptr(n, data_size, req);
+-    if (status) {
++    if (status)
++    {
+         goto err;
+     }
+ 
+     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
++    zns_ssd_rw(n->zns_ssd, req);
+     zns_finalize_zoned_write(ns, req, false);
+ 
+     return NVME_SUCCESS;
+@@ -1231,10 +1385,10 @@ err:
+     return status | NVME_DNR;
+ }
+ 
+-static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+-                           NvmeRequest *req)
++static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
+ {
+-    switch (cmd->opcode) {
++    switch (cmd->opcode)
++    {
+     case NVME_CMD_READ:
+         return zns_read(n, ns, cmd, req);
+     case NVME_CMD_WRITE:
+@@ -1272,13 +1426,19 @@ static int zns_init_zone_cap(FemuCtrl *n)
+ {
+     n->zoned = true;
+     n->zasl_bs = NVME_DEFAULT_MAX_AZ_SIZE;
+-    n->zone_size_bs = NVME_DEFAULT_ZONE_SIZE;
+-    n->zone_cap_bs = 0;
++    n->zone_size_bs = n->zns_ssd->zsp.zone_size;
++    n->zone_cap_bs = n->zns_ssd->zsp.zone_capacity;
+     n->cross_zone_read = false;
+-    n->max_active_zones = 0;
+-    n->max_open_zones = 0;
++    // open 代表正在写入的 zone；而 active 是指所有被使用的 zone
++    // 所以理论上 active >>= open
++    // 实际上 active 时 superblock 也是打开状态，仍然消耗硬件资源
++    // 所以可以简单的认为 active == open
++    n->max_active_zones = n->active_zones_limit; // 0 = 无限制
++    n->max_open_zones = n->max_active_zones;     // 0 = 无限制
+     n->zd_extension_size = 0;
+ 
++    qemu_spin_init(&n->zone_aor_lock);
++
+     return 0;
+ }
+ 
+@@ -1287,13 +1447,18 @@ static int zns_start_ctrl(FemuCtrl *n)
+     /* Coperd: let's fail early before anything crazy happens */
+     assert(n->page_size == 4096);
+ 
+-    if (!n->zasl_bs) {
++    if (!n->zasl_bs)
++    {
+         n->zasl = n->mdts;
+-    } else {
+-        if (n->zasl_bs < n->page_size) {
++    }
++    else
++    {
++        if (n->zasl_bs < n->page_size)
++        {
+             femu_err("ZASL too small (%dB), must >= 1 page (4K)\n", n->zasl_bs);
+             return -1;
+         }
++        // 等价于 n->zasl_bs = n->page_size * 2 ^ (n->zasl)
+         n->zasl = 31 - clz32(n->zasl_bs / n->page_size);
+     }
+ 
+@@ -1306,9 +1471,13 @@ static void zns_init(FemuCtrl *n, Error **errp)
+ 
+     zns_set_ctrl(n);
+ 
++    n->zns_ssd = g_malloc0(sizeof(ZNS_SSD));
++    zns_ssd_init(n);
++
+     zns_init_zone_cap(n);
+ 
+-    if (zns_init_zone_geometry(ns, errp) != 0) {
++    if (zns_init_zone_geometry(ns, errp) != 0)
++    {
+         return;
+     }
+ 
+@@ -1324,15 +1493,15 @@ static void zns_exit(FemuCtrl *n)
+ 
+ int nvme_register_znssd(FemuCtrl *n)
+ {
+-    n->ext_ops = (FemuExtCtrlOps) {
+-        .state            = NULL,
+-        .init             = zns_init,
+-        .exit             = zns_exit,
+-        .rw_check_req     = NULL,
+-        .start_ctrl       = zns_start_ctrl,
+-        .admin_cmd        = zns_admin_cmd,
+-        .io_cmd           = zns_io_cmd,
+-        .get_log          = NULL,
++    n->ext_ops = (FemuExtCtrlOps){
++        .state = NULL,
++        .init = zns_init,
++        .exit = zns_exit,
++        .rw_check_req = NULL,
++        .start_ctrl = zns_start_ctrl,
++        .admin_cmd = zns_admin_cmd,
++        .io_cmd = zns_io_cmd,
++        .get_log = NULL,
+     };
+ 
+     return 0;
+diff --git a/hw/femu/zns/zns.h b/hw/femu/zns/zns.h
+index a36bd991e..8f3f91cf8 100644
+--- a/hw/femu/zns/zns.h
++++ b/hw/femu/zns/zns.h
+@@ -3,113 +3,131 @@
+ 
+ #include "../nvme.h"
+ 
+-typedef struct QEMU_PACKED NvmeZonedResult {
++typedef struct QEMU_PACKED NvmeZonedResult
++{
+     uint64_t slba;
+ } NvmeZonedResult;
+ 
+-typedef struct NvmeIdCtrlZoned {
+-    uint8_t     zasl;
+-    uint8_t     rsvd1[4095];
++typedef struct NvmeIdCtrlZoned
++{
++    uint8_t zasl;
++    uint8_t rsvd1[4095];
+ } NvmeIdCtrlZoned;
+ 
+-enum NvmeZoneAttr {
+-    NVME_ZA_FINISHED_BY_CTLR         = 1 << 0,
+-    NVME_ZA_FINISH_RECOMMENDED       = 1 << 1,
+-    NVME_ZA_RESET_RECOMMENDED        = 1 << 2,
+-    NVME_ZA_ZD_EXT_VALID             = 1 << 7,
++enum NvmeZoneAttr
++{
++    NVME_ZA_FINISHED_BY_CTLR = 1 << 0,
++    NVME_ZA_FINISH_RECOMMENDED = 1 << 1,
++    NVME_ZA_RESET_RECOMMENDED = 1 << 2,
++    NVME_ZA_ZD_EXT_VALID = 1 << 7,
+ };
+ 
+-typedef struct QEMU_PACKED NvmeZoneReportHeader {
+-    uint64_t    nr_zones;
+-    uint8_t     rsvd[56];
++typedef struct QEMU_PACKED NvmeZoneReportHeader
++{
++    uint64_t nr_zones;
++    uint8_t rsvd[56];
+ } NvmeZoneReportHeader;
+ 
+-enum NvmeZoneReceiveAction {
+-    NVME_ZONE_REPORT                 = 0,
+-    NVME_ZONE_REPORT_EXTENDED        = 1,
++enum NvmeZoneReceiveAction
++{
++    NVME_ZONE_REPORT = 0,
++    NVME_ZONE_REPORT_EXTENDED = 1,
+ };
+ 
+-enum NvmeZoneReportType {
+-    NVME_ZONE_REPORT_ALL             = 0,
+-    NVME_ZONE_REPORT_EMPTY           = 1,
++enum NvmeZoneReportType
++{
++    NVME_ZONE_REPORT_ALL = 0,
++    NVME_ZONE_REPORT_EMPTY = 1,
+     NVME_ZONE_REPORT_IMPLICITLY_OPEN = 2,
+     NVME_ZONE_REPORT_EXPLICITLY_OPEN = 3,
+-    NVME_ZONE_REPORT_CLOSED          = 4,
+-    NVME_ZONE_REPORT_FULL            = 5,
+-    NVME_ZONE_REPORT_READ_ONLY       = 6,
+-    NVME_ZONE_REPORT_OFFLINE         = 7,
++    NVME_ZONE_REPORT_CLOSED = 4,
++    NVME_ZONE_REPORT_FULL = 5,
++    NVME_ZONE_REPORT_READ_ONLY = 6,
++    NVME_ZONE_REPORT_OFFLINE = 7,
+ };
+ 
+-enum NvmeZoneType {
+-    NVME_ZONE_TYPE_RESERVED          = 0x00,
+-    NVME_ZONE_TYPE_SEQ_WRITE         = 0x02,
++enum NvmeZoneType
++{
++    NVME_ZONE_TYPE_RESERVED = 0x00,
++    NVME_ZONE_TYPE_SEQ_WRITE = 0x02,
+ };
+ 
+-enum NvmeZoneSendAction {
+-    NVME_ZONE_ACTION_RSD             = 0x00,
+-    NVME_ZONE_ACTION_CLOSE           = 0x01,
+-    NVME_ZONE_ACTION_FINISH          = 0x02,
+-    NVME_ZONE_ACTION_OPEN            = 0x03,
+-    NVME_ZONE_ACTION_RESET           = 0x04,
+-    NVME_ZONE_ACTION_OFFLINE         = 0x05,
+-    NVME_ZONE_ACTION_SET_ZD_EXT      = 0x10,
++enum NvmeZoneSendAction
++{
++    NVME_ZONE_ACTION_RSD = 0x00,
++    NVME_ZONE_ACTION_CLOSE = 0x01,
++    NVME_ZONE_ACTION_FINISH = 0x02,
++    NVME_ZONE_ACTION_OPEN = 0x03,
++    NVME_ZONE_ACTION_RESET = 0x04,
++    NVME_ZONE_ACTION_OFFLINE = 0x05,
++    NVME_ZONE_ACTION_MERGE = 0x06,
++    NVME_ZONE_ACTION_SPLIT = 0x07,
++    NVME_ZONE_ACTION_SET_ZD_EXT = 0x10,
+ };
+ 
+-typedef struct QEMU_PACKED NvmeZoneDescr {
+-    uint8_t     zt;
+-    uint8_t     zs;
+-    uint8_t     za;
+-    uint8_t     rsvd3[5];
+-    uint64_t    zcap;
+-    uint64_t    zslba;
+-    uint64_t    wp;
+-    uint8_t     rsvd32[32];
++typedef struct QEMU_PACKED NvmeZoneDescr
++{
++    uint8_t zt;
++    uint8_t zs;
++    uint8_t za;
++    uint8_t rsvd3[5];
++    uint64_t zcap;
++    uint64_t zslba;
++    uint64_t wp;
++    uint64_t zlen;
++    uint8_t rsvd24[24];
+ } NvmeZoneDescr;
+ 
+-typedef enum NvmeZoneState {
+-    NVME_ZONE_STATE_RESERVED         = 0x00,
+-    NVME_ZONE_STATE_EMPTY            = 0x01,
+-    NVME_ZONE_STATE_IMPLICITLY_OPEN  = 0x02,
+-    NVME_ZONE_STATE_EXPLICITLY_OPEN  = 0x03,
+-    NVME_ZONE_STATE_CLOSED           = 0x04,
+-    NVME_ZONE_STATE_READ_ONLY        = 0x0D,
+-    NVME_ZONE_STATE_FULL             = 0x0E,
+-    NVME_ZONE_STATE_OFFLINE          = 0x0F,
++typedef enum NvmeZoneState
++{
++    NVME_ZONE_STATE_RESERVED = 0x00,
++    NVME_ZONE_STATE_EMPTY = 0x01,
++    NVME_ZONE_STATE_IMPLICITLY_OPEN = 0x02,
++    NVME_ZONE_STATE_EXPLICITLY_OPEN = 0x03,
++    NVME_ZONE_STATE_CLOSED = 0x04,
++    NVME_ZONE_STATE_MERGE = 0x05,
++    NVME_ZONE_STATE_READ_ONLY = 0x0D,
++    NVME_ZONE_STATE_FULL = 0x0E,
++    NVME_ZONE_STATE_OFFLINE = 0x0F,
+ } NvmeZoneState;
+ 
+ #define NVME_SET_CSI(vec, csi) (vec |= (uint8_t)(1 << (csi)))
+ 
+-typedef struct QEMU_PACKED NvmeLBAFE {
+-    uint64_t    zsze;
+-    uint8_t     zdes;
+-    uint8_t     rsvd9[7];
++typedef struct QEMU_PACKED NvmeLBAFE
++{
++    uint64_t zsze;
++    uint8_t zdes;
++    uint8_t rsvd9[7];
+ } NvmeLBAFE;
+ 
+-typedef struct QEMU_PACKED NvmeIdNsZoned {
+-    uint16_t    zoc;
+-    uint16_t    ozcs;
+-    uint32_t    mar;
+-    uint32_t    mor;
+-    uint32_t    rrl;
+-    uint32_t    frl;
+-    uint8_t     rsvd20[2796];
+-    NvmeLBAFE   lbafe[16];
+-    uint8_t     rsvd3072[768];
+-    uint8_t     vs[256];
++typedef struct QEMU_PACKED NvmeIdNsZoned
++{
++    uint16_t zoc;
++    uint16_t ozcs;
++    uint32_t mar;
++    uint32_t mor;
++    uint32_t rrl;
++    uint32_t frl;
++    uint8_t rsvd20[2796];
++    NvmeLBAFE lbafe[16];
++    uint8_t rsvd3072[768];
++    uint8_t vs[256];
+ } NvmeIdNsZoned;
+ 
+-typedef struct NvmeZone {
+-    NvmeZoneDescr   d;
+-    uint64_t        w_ptr;
++typedef struct NvmeZone
++{
++    NvmeZoneDescr d;
++    uint64_t w_ptr;
+     QTAILQ_ENTRY(NvmeZone) entry;
+ } NvmeZone;
+ 
+-typedef struct NvmeNamespaceParams {
++typedef struct NvmeNamespaceParams
++{
+     uint32_t nsid;
+     QemuUUID uuid;
+ 
+-    bool     zoned;
+-    bool     cross_zone_read;
++    bool zoned;
++    bool cross_zone_read;
+     uint64_t zone_size_bs;
+     uint64_t zone_cap_bs;
+     uint32_t max_active_zones;
+@@ -119,7 +137,8 @@ typedef struct NvmeNamespaceParams {
+ 
+ static inline uint32_t zns_nsid(NvmeNamespace *ns)
+ {
+-    if (ns) {
++    if (ns)
++    {
+         return ns->id;
+     }
+ 
+@@ -162,7 +181,7 @@ static inline void zns_set_zone_state(NvmeZone *zone, NvmeZoneState state)
+ 
+ static inline uint64_t zns_zone_rd_boundary(NvmeNamespace *ns, NvmeZone *zone)
+ {
+-    return zone->d.zslba + ns->ctrl->zone_size;
++    return zone->d.zslba + zone->d.zlen;
+ }
+ 
+ static inline uint64_t zns_zone_wr_boundary(NvmeZone *zone)
+@@ -174,9 +193,7 @@ static inline bool zns_wp_is_valid(NvmeZone *zone)
+ {
+     uint8_t st = zns_get_zone_state(zone);
+ 
+-    return st != NVME_ZONE_STATE_FULL &&
+-           st != NVME_ZONE_STATE_READ_ONLY &&
+-           st != NVME_ZONE_STATE_OFFLINE;
++    return st != NVME_ZONE_STATE_FULL && st != NVME_ZONE_STATE_READ_ONLY && st != NVME_ZONE_STATE_OFFLINE;
+ }
+ 
+ static inline uint8_t *zns_get_zd_extension(NvmeNamespace *ns, uint32_t zone_idx)
+@@ -184,48 +201,100 @@ static inline uint8_t *zns_get_zd_extension(NvmeNamespace *ns, uint32_t zone_idx
+     return &ns->ctrl->zd_extensions[zone_idx * ns->ctrl->zd_extension_size];
+ }
+ 
+-static inline void zns_aor_inc_open(NvmeNamespace *ns)
++static inline int zns_aor_inc_open(NvmeNamespace *ns)
+ {
+     FemuCtrl *n = ns->ctrl;
+-    assert(n->nr_open_zones >= 0);
+-    if (n->max_open_zones) {
+-        n->nr_open_zones++;
+-        assert(n->nr_open_zones <= n->max_open_zones);
++    if (n->max_open_zones)
++    {
++        qemu_spin_lock(&n->zone_aor_lock);
++        assert(n->nr_open_zones >= 0);
++        if (n->nr_open_zones < n->max_open_zones)
++        {
++            n->nr_open_zones++;
++        }
++        else
++        {
++            qemu_spin_unlock(&n->zone_aor_lock);
++            return NVME_ZONE_TOO_MANY_OPEN | NVME_DNR;
++        }
++        qemu_spin_unlock(&n->zone_aor_lock);
+     }
++    return NVME_SUCCESS;
+ }
+ 
+ static inline void zns_aor_dec_open(NvmeNamespace *ns)
+ {
+     FemuCtrl *n = ns->ctrl;
+-    if (n->max_open_zones) {
++    if (n->max_open_zones)
++    {
++        qemu_spin_lock(&n->zone_aor_lock);
+         assert(n->nr_open_zones > 0);
+         n->nr_open_zones--;
++        qemu_spin_unlock(&n->zone_aor_lock);
+     }
+-    assert(n->nr_open_zones >= 0);
+ }
+ 
+-static inline void zns_aor_inc_active(NvmeNamespace *ns)
++static inline int zns_aor_inc_active(NvmeNamespace *ns)
+ {
+     FemuCtrl *n = ns->ctrl;
+-    assert(n->nr_active_zones >= 0);
+-    if (n->max_active_zones) {
+-        n->nr_active_zones++;
+-        assert(n->nr_active_zones <= n->max_active_zones);
++    if (n->max_active_zones)
++    {
++        qemu_spin_lock(&n->zone_aor_lock);
++        assert(n->nr_active_zones >= 0);
++        if (n->nr_active_zones < n->max_active_zones)
++        {
++            n->nr_active_zones++;
++        }
++        else
++        {
++            qemu_spin_unlock(&n->zone_aor_lock);
++            return NVME_ZONE_TOO_MANY_ACTIVE | NVME_DNR;
++        }
++        qemu_spin_unlock(&n->zone_aor_lock);
+     }
++    return NVME_SUCCESS;
+ }
+ 
+ static inline void zns_aor_dec_active(NvmeNamespace *ns)
+ {
+     FemuCtrl *n = ns->ctrl;
+-    if (n->max_active_zones) {
++    if (n->max_active_zones)
++    {
++        qemu_spin_lock(&n->zone_aor_lock);
+         assert(n->nr_active_zones > 0);
+         n->nr_active_zones--;
+         assert(n->nr_active_zones >= n->nr_open_zones);
++        qemu_spin_unlock(&n->zone_aor_lock);
+     }
+-    assert(n->nr_active_zones >= 0);
+ }
+ 
+ void zns_ns_shutdown(NvmeNamespace *ns);
+ void zns_ns_cleanup(NvmeNamespace *ns);
+ 
++// #define FEMU_DEBUG_ZNS
++#ifdef FEMU_DEBUG_ZNS
++#define zns_debug(fmt, ...)                                                                                            \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        printf("[FEMU] ZNS-Debug: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                                     \
++    } while (0)
++#else
++#define zns_debug(fmt, ...)                                                                                            \
++    do                                                                                                                 \
++    {                                                                                                                  \
++    } while (0)
++#endif
++
++#define zns_error(fmt, ...)                                                                                            \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        fprintf(stderr, "[FEMU] ZNS-Error: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                            \
++    } while (0)
++
++#define zns_log(fmt, ...)                                                                                              \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        printf("[FEMU] ZNS-Log: %s:%d " fmt, __func__, __LINE__, ##__VA_ARGS__);                                       \
++    } while (0)
++
+ #endif
