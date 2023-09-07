@@ -7,3 +7,6 @@
 [submodule "Softwares/zenfs/base"]
 	path = Softwares/zenfs/base
 	url = git@github.com:westerndigitalcorporation/zenfs.git
+[submodule "Softwares/rocksdb/base"]
+	path = Softwares/rocksdb/base
+	url = git@github.com:facebook/rocksdb.git
