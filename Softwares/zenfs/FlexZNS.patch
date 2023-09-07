@@ -1,0 +1,869 @@
+diff --git a/fs/fs_zenfs.cc b/fs/fs_zenfs.cc
+index 0ad9e3e..9ac8171 100644
+--- a/fs/fs_zenfs.cc
++++ b/fs/fs_zenfs.cc
+@@ -269,9 +269,89 @@ ZenFS::~ZenFS() {
+   delete zbd_;
+ }
+ 
++std::string GetCurrentTime() {
++  auto now = std::chrono::system_clock::now();
++  auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
++  auto value = now_ms.time_since_epoch();
++  long duration = value.count();
++  long ms = duration % 1000;
++  std::time_t t = std::chrono::system_clock::to_time_t(now);
++  std::tm* tm = std::localtime(&t);
++  std::ostringstream oss;
++  oss << std::put_time(tm, "%Y/%m/%d-%H:%M:%S") << "." << std::setfill('0')
++      << std::setw(3) << ms;
++  std::string time_str = oss.str();
++  return time_str;
++}
++
++void ZenFS::ForceGC() {
++  ZenFSSnapshot snapshot;
++  ZenFSSnapshotOptions options;
++
++  options.zone_ = 1;
++  options.zone_file_ = 1;
++
++  GetZenFSSnapshot(snapshot, options);
++
++  std::vector<std::pair<ZoneSnapshot, uint64_t>> migrate_zones;
++  for (const auto& zone : snapshot.zones_) {
++    if ((zone.capacity == 0) && (zone.lifetime >= Env::WLTH_MEDIUM) &&
++        (zone.used_capacity <= zbd_->GetGCZone(zone.small_zone)->capacity_)) {
++      uint64_t garbage_percent_approx =
++          100 - 100 * zone.used_capacity / zone.max_capacity;
++      migrate_zones.push_back(
++          std::make_pair(zone, garbage_percent_approx));
++    }
++  }
++
++  // sort by garbage_percent_approx dec
++  sort(migrate_zones.begin(), migrate_zones.end(),
++       [this](const auto& a, const auto& b) { return a.second > b.second; });
++
++  for (const auto& migrate_zone_pair : migrate_zones) {
++    ZoneSnapshot migrate_zone = migrate_zone_pair.first;
++    uint64_t ext_length = 0;
++    std::vector<ZoneExtentSnapshot*> migrate_exts = {};
++    for (auto& ext : snapshot.extents_) {
++      if (ext.zone_start == migrate_zone.start) {
++        migrate_exts.push_back(&ext);
++        ext_length += ext.length;
++      }
++    }
++    if (migrate_zone.used_capacity != ext_length) continue;
++
++    if (migrate_exts.size() > 0) {
++      uint64_t reclaim_space = 0;
++      uint64_t last_gc_written = zbd_->GetGCBytesWritten();
++      std::string start_time = GetCurrentTime();
++      IOStatus s = ForceMigrateOneZone(migrate_exts, reclaim_space);
++      std::string finish_time = GetCurrentTime();
++      last_gc_written = zbd_->GetGCBytesWritten() - last_gc_written;
++      fprintf(stderr,
++              "%s~%s Force Garbage collection: Migrate %lu Bytes, %lu MB, "
++              "Reclaim %lu Bytes, %lu MB\n",
++              start_time.c_str(),
++              finish_time.substr(finish_time.size() - 12).c_str(),
++              last_gc_written, last_gc_written / 1024 / 1024, reclaim_space,
++              reclaim_space / 1024 / 1024);
++      if (!s.ok()) {
++        fprintf(stderr, "%s~%s Force Garbage collection failed %s\n",
++                start_time.c_str(),
++                finish_time.substr(finish_time.size() - 12).c_str(),
++                s.ToString().c_str());
++        break;
++      }
++      if (zbd_->GetGCZone(migrate_zone.small_zone)->IsEmpty()) break;
++    }
++  }
++  zbd_->ForceGCNotify();
++}
++
+ void ZenFS::GCWorker() {
+   while (run_gc_worker_) {
+-    usleep(1000 * 1000 * 10);
++    if (zbd_->NeedForceGC(1)) {
++      ForceGC();
++    }
+ 
+     uint64_t non_free = zbd_->GetUsedSpace() + zbd_->GetReclaimableSpace();
+     uint64_t free = zbd_->GetFreeSpace();
+@@ -293,8 +373,8 @@ void ZenFS::GCWorker() {
+       if (zone.capacity == 0) {
+         uint64_t garbage_percent_approx =
+             100 - 100 * zone.used_capacity / zone.max_capacity;
+-        if (garbage_percent_approx > threshold &&
+-            garbage_percent_approx < 100) {
++        if (garbage_percent_approx >= threshold &&
++            garbage_percent_approx <= 100) {
+           migrate_zones_start.emplace(zone.start);
+         }
+       }
+@@ -310,12 +390,24 @@ void ZenFS::GCWorker() {
+ 
+     if (migrate_exts.size() > 0) {
+       IOStatus s;
+-      Info(logger_, "Garbage collecting %d extents \n",
+-           (int)migrate_exts.size());
+-      s = MigrateExtents(migrate_exts);
++      uint64_t reclaim_space = 0;
++      uint64_t last_gc_written = zbd_->GetGCBytesWritten();
++      std::string start_time = GetCurrentTime();
++      s = MigrateExtents(migrate_exts, &reclaim_space);
++      std::string finish_time = GetCurrentTime();
+       if (!s.ok()) {
+         Error(logger_, "Garbage collection failed");
+       }
++      last_gc_written = zbd_->GetGCBytesWritten() - last_gc_written;
++      if (last_gc_written > 0) {
++        fprintf(stderr,
++                "%s~%s Garbage collection: Migrate %lu Bytes, %lu MB, Reclaim "
++                "%lu Bytes, %lu MB\n",
++                start_time.c_str(),
++                finish_time.substr(finish_time.size() - 12).c_str(),
++                last_gc_written, last_gc_written / 1024 / 1024, reclaim_space,
++                reclaim_space / 1024 / 1024);
++      }
+     }
+   }
+ }
+@@ -333,6 +425,19 @@ IOStatus ZenFS::Repair() {
+   return IOStatus::OK();
+ }
+ 
++void ZenFS::RebuildZoneLifeTime() {
++  std::map<std::string, std::shared_ptr<ZoneFile>>::iterator it;
++  for (it = files_.begin(); it != files_.end(); it++) {
++    std::shared_ptr<ZoneFile> zFile = it->second;
++    std::vector<ZoneExtent*> extents = zFile->GetExtents();
++    Env::WriteLifeTimeHint file_lifetime = zFile->GetWriteLifeTimeHint();
++    for (const auto* ext : extents) {
++      Zone* zone = ext->zone_;
++      if (zone->lifetime_ < file_lifetime) zone->lifetime_ = file_lifetime;
++    }
++  }
++}
++
+ std::string ZenFS::FormatPathLexically(fs::path filepath) {
+   fs::path ret = fs::path("/") / filepath.lexically_normal();
+   return ret.string();
+@@ -1471,6 +1576,8 @@ Status ZenFS::Mount(bool readonly) {
+     }
+   }
+ 
++  RebuildZoneLifeTime();
++
+   Info(logger_, "Superblock sequence %d", (int)superblock_->GetSeq());
+   Info(logger_, "Finish threshold %u", superblock_->GetFinishTreshold());
+   Info(logger_, "Filesystem mount OK");
+@@ -1482,6 +1589,8 @@ Status ZenFS::Mount(bool readonly) {
+     Info(logger_, "  Done");
+ 
+     if (superblock_->IsGCEnabled()) {
++      status = zbd_->ReserveEmptyZoneForGC();
++      if (!status.ok()) return status;
+       Info(logger_, "Starting garbage collection worker");
+       run_gc_worker_ = true;
+       gc_worker_.reset(new std::thread(&ZenFS::GCWorker, this));
+@@ -1745,7 +1854,8 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
+ }
+ 
+ IOStatus ZenFS::MigrateExtents(
+-    const std::vector<ZoneExtentSnapshot*>& extents) {
++    const std::vector<ZoneExtentSnapshot*>& extents,
++    uint64_t* reclaim_space) {
+   IOStatus s;
+   // Group extents by their filename
+   std::map<std::string, std::vector<ZoneExtentSnapshot*>> file_extents;
+@@ -1760,8 +1870,9 @@ IOStatus ZenFS::MigrateExtents(
+   for (const auto& it : file_extents) {
+     s = MigrateFileExtents(it.first, it.second);
+     if (!s.ok()) break;
+-    s = zbd_->ResetUnusedIOZones();
++    s = zbd_->ResetUnusedIOZones(reclaim_space);
+     if (!s.ok()) break;
++    if (zbd_->NeedForceGC(0)) return IOStatus::OK();
+   }
+   return s;
+ }
+@@ -1857,6 +1968,164 @@ IOStatus ZenFS::MigrateFileExtents(
+   return IOStatus::OK();
+ }
+ 
++IOStatus ZenFS::ForceMigrateOneZone(
++    const std::vector<ZoneExtentSnapshot*>& extents,
++    uint64_t& reclaim_space) {
++  IOStatus s = IOStatus::OK();
++
++  Zone* victim_zone = zbd_->GetIOZone(extents.front()->zone_start);
++  if (!victim_zone->Acquire()) {
++    return IOStatus::OK();
++  }
++
++  bool small_zone = victim_zone->small_zone_;
++  assert(zbd_->GetGCZone(small_zone));
++  s = zbd_->OpenGCZone(small_zone);
++  if (!s.ok()) {
++    fprintf(stderr, "OpenGCZone Failed\n");
++    return s;
++  }
++
++  // Group extents by their filename
++  std::map<std::string, std::vector<ZoneExtentSnapshot*>> file_extents;
++  for (auto* ext : extents) {
++    std::string fname = ext->filename;
++    file_extents[fname].emplace_back(ext);
++  }
++
++  // lock all files in victim zone
++  std::vector<std::string> locked_files;
++  bool lock_zfiles = true;
++  for (const auto& it : file_extents) {
++    // The file may be deleted by other threads, better double check.
++    auto zfile = GetFile(it.first);
++    if (zfile == nullptr) {
++      continue;
++    }
++
++    // Don't migrate open for write files and prevent write reopens while we
++    // migrate
++    if (!zfile->TryAcquireWRLock()) {
++      lock_zfiles = false;
++      break;
++    }
++
++    locked_files.push_back(it.first);
++  }
++
++  // release lock if we can't lock all files
++  if (lock_zfiles == false) {
++    for (const auto& fname : locked_files) {
++      auto zfile = GetFile(fname);
++      if (zfile == nullptr) {
++        continue;
++      }
++      zfile->ReleaseWRLock();
++    }
++    zbd_->CloseGCZone();
++    return IOStatus::OK();
++  }
++
++  // migrate the victim zone and release file WRLock
++  for (const auto& it : file_extents) {
++    s = ForceMigrateFileExtents(it.first, it.second, small_zone);
++    if (!s.ok()) {
++      fprintf(stderr, "ForceMigrateFileExtents Failed\n");
++      zbd_->CloseGCZone();
++      return s;
++    }
++    auto zfile = GetFile(it.first);
++    if (zfile == nullptr) {
++      continue;
++    }
++    zfile->ReleaseWRLock();
++  }
++
++  zbd_->CloseGCZone();
++
++  // reset and reserve zone for next force gc
++  bool zone_reset = zbd_->TryResetZoneForGC(victim_zone);
++  if (!zone_reset) {
++    if (!victim_zone->Release()) {
++      return IOStatus::Aborted("Release victim_zone Failed");
++    }
++    return IOStatus::Aborted("TryResetZoneForGC Failed");
++  }
++  reclaim_space += victim_zone->max_capacity_;
++
++  assert(zbd_->GetGCZone(small_zone));
++
++  return IOStatus::OK();
++}
++
++IOStatus ZenFS::ForceMigrateFileExtents(
++    const std::string& fname,
++    const std::vector<ZoneExtentSnapshot*>& migrate_exts,
++    bool small_zone) {
++  IOStatus s = IOStatus::OK();
++
++  // The file may be deleted by other threads, better double check.
++  auto zfile = GetFile(fname);
++  if (zfile == nullptr) {
++    return IOStatus::OK();
++  }
++
++  std::vector<ZoneExtent*> new_extent_list;
++  std::vector<ZoneExtent*> extents = zfile->GetExtents();
++  for (const auto* ext : extents) {
++    new_extent_list.push_back(
++        new ZoneExtent(ext->start_, ext->length_, ext->zone_));
++  }
++
++  // Modify the new extent list
++  for (ZoneExtent* ext : new_extent_list) {
++    // Check if current extent need to be migrated
++    auto it = std::find_if(migrate_exts.begin(), migrate_exts.end(),
++                           [&](const ZoneExtentSnapshot* ext_snapshot) {
++                             return ext_snapshot->start == ext->start_ &&
++                                    ext_snapshot->length == ext->length_;
++                           });
++
++    if (it == migrate_exts.end()) {
++      Info(logger_, "Migrate extent not found, ext_start: %lu", ext->start_);
++      continue;
++    }
++
++    Zone* target_zone = zbd_->GetGCZone(small_zone);
++    if (target_zone->capacity_ < ext->length_) continue;
++    uint64_t target_start = target_zone->wp_;
++    if (zfile->IsSparse()) {
++      // For buffered write, ZenFS use inlined metadata for extents and each
++      // extent has a SPARSE_HEADER_SIZE.
++      target_start = target_zone->wp_ + ZoneFile::SPARSE_HEADER_SIZE;
++      zfile->MigrateData(ext->start_ - ZoneFile::SPARSE_HEADER_SIZE,
++                         ext->length_ + ZoneFile::SPARSE_HEADER_SIZE,
++                         target_zone);
++      zbd_->AddGCBytesWritten(ext->length_ + ZoneFile::SPARSE_HEADER_SIZE);
++    } else {
++      zfile->MigrateData(ext->start_, ext->length_, target_zone);
++      zbd_->AddGCBytesWritten(ext->length_);
++    }
++
++    // If the file doesn't exist, skip
++    if (GetFileNoLock(fname) == nullptr) {
++      Info(logger_, "Migrate file not exist anymore.");
++      break;
++    }
++
++    ext->start_ = target_start;
++    ext->zone_ = target_zone;
++    ext->zone_->used_capacity_ += ext->length_;
++  }
++
++  SyncFileExtents(zfile.get(), new_extent_list);
++
++  Info(logger_,
++       "ForceMigrateFileExtents Finished, fname: %s, extent count: %lu",
++       fname.data(), migrate_exts.size());
++  return IOStatus::OK();
++}
++
+ extern "C" FactoryFunc<FileSystem> zenfs_filesystem_reg;
+ 
+ FactoryFunc<FileSystem> zenfs_filesystem_reg =
+diff --git a/fs/fs_zenfs.h b/fs/fs_zenfs.h
+index 41abc9d..9a74409 100644
+--- a/fs/fs_zenfs.h
++++ b/fs/fs_zenfs.h
+@@ -252,6 +252,8 @@ class ZenFS : public FileSystemWrapper {
+ 
+   IOStatus Repair();
+ 
++  void RebuildZoneLifeTime();
++
+   /* Must hold files_mtx_ */
+   IOStatus DeleteDirRecursiveNoLock(const std::string& d,
+                                     const IOOptions& options,
+@@ -451,17 +453,27 @@ class ZenFS : public FileSystemWrapper {
+   void GetZenFSSnapshot(ZenFSSnapshot& snapshot,
+                         const ZenFSSnapshotOptions& options);
+ 
+-  IOStatus MigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents);
++  IOStatus MigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents,
++                          uint64_t* reclaim_space);
+ 
+   IOStatus MigrateFileExtents(
+       const std::string& fname,
+       const std::vector<ZoneExtentSnapshot*>& migrate_exts);
+ 
++  IOStatus ForceMigrateOneZone(const std::vector<ZoneExtentSnapshot*>& extents,
++                               uint64_t& reclaim_space);
++
++  IOStatus ForceMigrateFileExtents(
++      const std::string& fname,
++      const std::vector<ZoneExtentSnapshot*>& migrate_exts,
++      bool small_zone);
++
+  private:
+   const uint64_t GC_START_LEVEL =
+       20;                      /* Enable GC when < 20% free space available */
+   const uint64_t GC_SLOPE = 3; /* GC agressiveness */
+   void GCWorker();
++  void ForceGC();
+ };
+ #endif  // !defined(ROCKSDB_LITE) && defined(OS_LINUX)
+ 
+diff --git a/fs/snapshot.h b/fs/snapshot.h
+index 91dcaac..3cd9b78 100644
+--- a/fs/snapshot.h
++++ b/fs/snapshot.h
+@@ -51,13 +51,18 @@ class ZoneSnapshot {
+   uint64_t used_capacity;
+   uint64_t max_capacity;
+ 
++  bool small_zone;
++  Env::WriteLifeTimeHint lifetime;
++
+  public:
+   ZoneSnapshot(const Zone& zone)
+       : start(zone.start_),
+         wp(zone.wp_),
+         capacity(zone.capacity_),
+         used_capacity(zone.used_capacity_),
+-        max_capacity(zone.max_capacity_) {}
++        max_capacity(zone.max_capacity_),
++        small_zone(zone.small_zone_),
++        lifetime(zone.lifetime_) {}
+ };
+ 
+ class ZoneExtentSnapshot {
+diff --git a/fs/zbd_zenfs.cc b/fs/zbd_zenfs.cc
+index b991597..660457c 100644
+--- a/fs/zbd_zenfs.cc
++++ b/fs/zbd_zenfs.cc
+@@ -55,12 +55,14 @@ Zone::Zone(ZonedBlockDevice *zbd, ZonedBlockDeviceBackend *zbd_be,
+       busy_(false),
+       start_(zbd_be->ZoneStart(zones, idx)),
+       max_capacity_(zbd_be->ZoneMaxCapacity(zones, idx)),
+-      wp_(zbd_be->ZoneWp(zones, idx)) {
++      wp_(zbd_be->ZoneWp(zones, idx)),
++      small_zone_(false) {
+   lifetime_ = Env::WLTH_NOT_SET;
+   used_capacity_ = 0;
+   capacity_ = 0;
+   if (zbd_be->ZoneIsWritable(zones, idx))
+     capacity_ = max_capacity_ - (wp_ - start_);
++  if (max_capacity_ / MB <= 1024) small_zone_ = true;
+ }
+ 
+ bool Zone::IsUsed() { return (used_capacity_ > 0); }
+@@ -108,7 +110,7 @@ IOStatus Zone::Finish() {
+   if (ios != IOStatus::OK()) return ios;
+ 
+   capacity_ = 0;
+-  wp_ = start_ + zbd_->GetZoneSize();
++  wp_ = start_ + max_capacity_;
+ 
+   return IOStatus::OK();
+ }
+@@ -165,7 +167,7 @@ inline IOStatus Zone::CheckRelease() {
+ 
+ Zone *ZonedBlockDevice::GetIOZone(uint64_t offset) {
+   for (const auto z : io_zones)
+-    if (z->start_ <= offset && offset < (z->start_ + zbd_be_->GetZoneSize()))
++    if (z->start_ <= offset && offset < (z->start_ + z->max_capacity_))
+       return z;
+   return nullptr;
+ }
+@@ -220,7 +222,9 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
+        zbd_be_->GetNrZones(), max_nr_active_zones, max_nr_open_zones);
+ 
+   zone_rep = zbd_be_->ListZones();
+-  if (zone_rep == nullptr || zone_rep->ZoneCount() != zbd_be_->GetNrZones()) {
++  // if (zone_rep == nullptr || zone_rep->ZoneCount() != zbd_be_->GetNrZones()) {
++  // 不参考 libzbd 获取的 zone 数量
++  if (zone_rep == nullptr) {
+     Error(logger_, "Failed to list zones");
+     return IOStatus::IOError("Failed to list zones");
+   }
+@@ -439,7 +443,7 @@ IOStatus ZonedBlockDevice::AllocateMetaZone(Zone **out_meta_zone) {
+   return IOStatus::NoSpace("Out of metadata zones");
+ }
+ 
+-IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
++IOStatus ZonedBlockDevice::ResetUnusedIOZones(uint64_t* reclaim_space) {
+   for (const auto z : io_zones) {
+     if (z->Acquire()) {
+       if (!z->IsEmpty() && !z->IsUsed()) {
+@@ -447,6 +451,7 @@ IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
+         IOStatus reset_status = z->Reset();
+         IOStatus release_status = z->CheckRelease();
+         if (!reset_status.ok()) return reset_status;
++        if (reclaim_space) (*reclaim_space)+= z->max_capacity_;
+         if (!release_status.ok()) return release_status;
+         if (!full) PutActiveIOZoneToken();
+       } else {
+@@ -591,12 +596,13 @@ IOStatus ZonedBlockDevice::FinishCheapestIOZone() {
+ 
+ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
+     Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out,
+-    Zone **zone_out, uint32_t min_capacity) {
++    Zone **zone_out, uint32_t min_capacity, bool must_small) {
+   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
+   Zone *allocated_zone = nullptr;
+   IOStatus s;
+ 
+   for (const auto z : io_zones) {
++    if ((must_small) && (z->small_zone_ == false)) continue;
+     if (z->Acquire()) {
+       if ((z->used_capacity_ > 0) && !z->IsFull() &&
+           z->capacity_ >= min_capacity) {
+@@ -629,10 +635,11 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
+   return IOStatus::OK();
+ }
+ 
+-IOStatus ZonedBlockDevice::AllocateEmptyZone(Zone **zone_out) {
++IOStatus ZonedBlockDevice::AllocateEmptyZone(Zone **zone_out, bool must_small) {
+   IOStatus s;
+   Zone *allocated_zone = nullptr;
+   for (const auto z : io_zones) {
++    if ((must_small) && (z->small_zone_ == false)) continue;
+     if (z->Acquire()) {
+       if (z->IsEmpty()) {
+         allocated_zone = z;
+@@ -685,6 +692,7 @@ IOStatus ZonedBlockDevice::ReleaseMigrateZone(Zone *zone) {
+     std::unique_lock<std::mutex> lock(migrate_zone_mtx_);
+     migrating_ = false;
+     if (zone != nullptr) {
++      PutOpenIOZoneToken();
+       s = zone->CheckRelease();
+       Info(logger_, "ReleaseMigrateZone: %lu", zone->start_);
+     }
+@@ -700,6 +708,7 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone,
+   migrate_resource_.wait(lock, [this] { return !migrating_; });
+ 
+   migrating_ = true;
++  WaitForOpenIOZoneToken(false);
+ 
+   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
+   auto s =
+@@ -707,16 +716,125 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone,
+   if (s.ok() && (*out_zone) != nullptr) {
+     Info(logger_, "TakeMigrateZone: %lu", (*out_zone)->start_);
+   } else {
+-    migrating_ = false;
++    while (!GetActiveIOZoneTokenIfAvailable()) {
++      s = FinishCheapestIOZone();
++      if (!s.ok()) {
++        PutOpenIOZoneToken();
++        migrating_ = false;
++        return s;
++      }
++    }
++
++    s = AllocateEmptyZone(out_zone);
++    if (!s.ok()) {
++      PutActiveIOZoneToken();
++      PutOpenIOZoneToken();
++      migrating_ = false;
++      return s;
++    }
++
++    if ((*out_zone) != nullptr) {
++      assert((*out_zone)->IsBusy());
++      (*out_zone)->lifetime_ = Env::WLTH_EXTREME;
++      return s;
++    } else {
++      PutActiveIOZoneToken();
++      PutOpenIOZoneToken();
++      migrating_ = false;
++    }
+   }
+ 
+   return s;
+ }
+ 
++void ZonedBlockDevice::ApplyForceGC() {
++  {
++    std::unique_lock<std::mutex> lock(force_gc_mtx_);
++    force_gc_ = true;
++  }
++  force_gc_resource_.notify_all();
++}
++
++void ZonedBlockDevice::WaitForceGCFinish() {
++  std::unique_lock<std::mutex> lock(force_gc_mtx_);
++  force_gc_resource_.wait_for(lock, std::chrono::seconds(5),
++                              [this] { return !force_gc_.load(); });
++}
++
++bool ZonedBlockDevice::NeedForceGC(int64_t sec) {
++  std::unique_lock<std::mutex> lock(force_gc_mtx_);
++  bool ret = false;
++  if (sec) {
++    ret = force_gc_resource_.wait_for(lock, std::chrono::seconds(sec),
++                                      [this] { return force_gc_.load(); });
++  } else {
++    ret = force_gc_.load();
++  }
++  return ret;
++}
++
++void ZonedBlockDevice::ForceGCNotify() {
++  {
++    std::unique_lock<std::mutex> lock(force_gc_mtx_);
++    force_gc_ = false;
++  }
++  force_gc_resource_.notify_all();
++}
++
++IOStatus ZonedBlockDevice::ReserveEmptyZoneForGC() {
++  AllocateEmptyZone(&(gc_zones_[1]), true);
++  return AllocateEmptyZone(&(gc_zones_[0]));
++}
++
++bool ZonedBlockDevice::TryResetZoneForGC(Zone *victim_zone) {
++  if (victim_zone->used_capacity_) {
++    return false;
++  }
++
++  IOStatus s = victim_zone->Reset();
++  if (!s.ok()) {
++    return false;
++  }
++
++  bool small_zone = victim_zone->small_zone_;
++
++  if (!gc_zones_[small_zone]->Release()) {
++    return false;
++  }
++
++  gc_zones_[small_zone] = victim_zone;
++  return true;
++}
++
++Zone *ZonedBlockDevice::GetGCZone(bool small_zone) {
++  return gc_zones_[small_zone];
++}
++
++IOStatus ZonedBlockDevice::OpenGCZone(bool small_zone) {
++  IOStatus s = IOStatus::OK();
++
++  WaitForOpenIOZoneToken(false);
++
++  if (gc_zones_[small_zone]->lifetime_ != Env::WLTH_EXTREME) {
++    while (!GetActiveIOZoneTokenIfAvailable()) {
++      s = FinishCheapestIOZone();
++      if (!s.ok()) {
++        PutOpenIOZoneToken();
++        return s;
++      }
++    }
++
++    gc_zones_[small_zone]->lifetime_ = Env::WLTH_EXTREME;
++  }
++
++  return IOStatus::OK();
++}
++
+ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
+                                           IOType io_type, Zone **out_zone) {
+-  Zone *allocated_zone = nullptr;
++  Zone *allocated_zone = nullptr, *candidate_zone = nullptr;
+   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
++  bool small_first = true;
+   int new_zone = 0;
+   IOStatus s;
+ 
+@@ -727,6 +845,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
+       tag = ZENFS_L0_IO_ALLOC_LATENCY;
+     } else {
+       tag = ZENFS_NON_WAL_IO_ALLOC_LATENCY;
++      small_first = false;
+     }
+   }
+ 
+@@ -746,10 +865,12 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
+     }
+   }
+ 
++AllocAgain:
+   WaitForOpenIOZoneToken(io_type == IOType::kWAL);
+ 
+   /* Try to fill an already open zone(with the best life time diff) */
+-  s = GetBestOpenZoneMatch(file_lifetime, &best_diff, &allocated_zone);
++  s = GetBestOpenZoneMatch(file_lifetime, &best_diff, &allocated_zone,
++                           small_first);
+   if (!s.ok()) {
+     PutOpenIOZoneToken();
+     return s;
+@@ -770,12 +891,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
+               "Allocator: avoided a finish by relaxing lifetime diff "
+               "requirement\n");
+       } else {
+-        s = allocated_zone->CheckRelease();
+-        if (!s.ok()) {
+-          PutOpenIOZoneToken();
+-          if (got_token) PutActiveIOZoneToken();
+-          return s;
+-        }
++        candidate_zone = allocated_zone;
+         allocated_zone = nullptr;
+       }
+     }
+@@ -791,7 +907,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
+         }
+       }
+ 
+-      s = AllocateEmptyZone(&allocated_zone);
++      s = AllocateEmptyZone(&allocated_zone, small_first);
+       if (!s.ok()) {
+         PutActiveIOZoneToken();
+         PutOpenIOZoneToken();
+@@ -799,10 +915,19 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
+       }
+ 
+       if (allocated_zone != nullptr) {
++        if (candidate_zone != nullptr) {
++          s = candidate_zone->CheckRelease();
++          if (!s.ok()) {
++            PutActiveIOZoneToken();
++            PutOpenIOZoneToken();
++            return s;
++          }
++        }
+         assert(allocated_zone->IsBusy());
+         allocated_zone->lifetime_ = file_lifetime;
+         new_zone = true;
+       } else {
++        allocated_zone = candidate_zone;
+         PutActiveIOZoneToken();
+       }
+     }
+@@ -816,6 +941,10 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
+           allocated_zone->lifetime_, file_lifetime);
+   } else {
+     PutOpenIOZoneToken();
++    small_first = false;
++    ApplyForceGC();
++    WaitForceGCFinish();
++    goto AllocAgain;
+   }
+ 
+   if (io_type != IOType::kWAL) {
+diff --git a/fs/zbd_zenfs.h b/fs/zbd_zenfs.h
+index c371109..67cecce 100644
+--- a/fs/zbd_zenfs.h
++++ b/fs/zbd_zenfs.h
+@@ -62,6 +62,7 @@ class Zone {
+   uint64_t capacity_; /* remaining capacity */
+   uint64_t max_capacity_;
+   uint64_t wp_;
++  bool small_zone_;
+   Env::WriteLifeTimeHint lifetime_;
+   std::atomic<uint64_t> used_capacity_;
+ 
+@@ -163,6 +164,11 @@ class ZonedBlockDevice {
+   std::mutex migrate_zone_mtx_;
+   std::atomic<bool> migrating_{false};
+ 
++  std::vector<Zone *> gc_zones_ = {nullptr, nullptr};
++  std::condition_variable force_gc_resource_;
++  std::mutex force_gc_mtx_;
++  std::atomic<bool> force_gc_{false};
++
+   unsigned int max_nr_active_io_zones_;
+   unsigned int max_nr_open_io_zones_;
+ 
+@@ -193,7 +199,7 @@ class ZonedBlockDevice {
+   std::string GetFilename();
+   uint32_t GetBlockSize();
+ 
+-  IOStatus ResetUnusedIOZones();
++  IOStatus ResetUnusedIOZones(uint64_t* reclaim_space=nullptr);
+   void LogZoneStats();
+   void LogZoneUsage();
+   void LogGarbageInfo();
+@@ -223,12 +229,24 @@ class ZonedBlockDevice {
+   IOStatus TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHint lifetime,
+                            uint32_t min_capacity);
+ 
++  void ApplyForceGC();
++  void WaitForceGCFinish();
++  bool NeedForceGC(int64_t sec);
++  void ForceGCNotify();
++
++  IOStatus ReserveEmptyZoneForGC();
++  bool TryResetZoneForGC(Zone *victim_zone);
++  Zone *GetGCZone(bool small_zone);
++  IOStatus OpenGCZone(bool small_zone);
++  void CloseGCZone() { PutOpenIOZoneToken(); };
++
+   void AddBytesWritten(uint64_t written) { bytes_written_ += written; };
+   void AddGCBytesWritten(uint64_t written) { gc_bytes_written_ += written; };
+   uint64_t GetUserBytesWritten() {
+     return bytes_written_.load() - gc_bytes_written_.load();
+   };
+   uint64_t GetTotalBytesWritten() { return bytes_written_.load(); };
++  uint64_t GetGCBytesWritten() { return gc_bytes_written_.load(); };
+ 
+  private:
+   IOStatus GetZoneDeferredStatus();
+@@ -238,8 +256,9 @@ class ZonedBlockDevice {
+   IOStatus FinishCheapestIOZone();
+   IOStatus GetBestOpenZoneMatch(Env::WriteLifeTimeHint file_lifetime,
+                                 unsigned int *best_diff_out, Zone **zone_out,
+-                                uint32_t min_capacity = 0);
+-  IOStatus AllocateEmptyZone(Zone **zone_out);
++                                uint32_t min_capacity = 0,
++                                bool must_small = false);
++  IOStatus AllocateEmptyZone(Zone **zone_out, bool must_small = false);
+ };
+ 
+ }  // namespace ROCKSDB_NAMESPACE
+diff --git a/fs/zbdlib_zenfs.cc b/fs/zbdlib_zenfs.cc
+index 2ad44e7..a9bea0b 100644
+--- a/fs/zbdlib_zenfs.cc
++++ b/fs/zbdlib_zenfs.cc
+@@ -101,7 +101,9 @@ IOStatus ZbdlibBackend::Open(bool readonly, bool exclusive,
+   IOStatus ios = CheckScheduler();
+   if (ios != IOStatus::OK()) return ios;
+ 
+-  block_sz_ = info.pblock_size;
++  // block_sz_ = info.pblock_size;
++  // fix block size to 4K
++  block_sz_ = 4096;
+   zone_sz_ = info.zone_size;
+   nr_zones_ = info.nr_zones;
+   *max_active_zones = info.max_nr_active_zones;
+diff --git a/util/zen-dump.py b/util/zen-dump.py
+index 711a224..8739a95 100755
+--- a/util/zen-dump.py
++++ b/util/zen-dump.py
+@@ -120,6 +120,14 @@ def get_files(data):
+ def print_file(file):
+     print(f"#{file.file_id} {file.filename}: size={size_human(file.size)} hint={file.hint} len(extents)={len(file.extents)}")
+ 
++def print_file_in_zone(file, zone):
++    extent_counter = 0
++    extent_size = 0
++    for extent in sorted(file.extents, key=lambda x: x["start"]):
++        if zone.start <= extent["start"] < zone.start + zone.max_capacity:
++            extent_counter += 1
++            extent_size += extent["length"]
++    print(f"#{file.file_id} {file.filename}: size={size_human(extent_size)} hint={file.hint} len(extents)={extent_counter}")
+ 
+ def cmd_files(data):
+     print("--- FILES ---")
+@@ -168,7 +176,7 @@ def cmd_extents(data):
+                 Extent(file.file_id, extent["start"], extent["length"]))
+             extents_in_zone[zone_id] = extent_list
+ 
+-    chunk_size = 4 * 1024 * 1024  # chunk size = 4MB
++    chunk_size = 1 * 1024 * 1024  # chunk size = 1MB
+     for zone in zones:
+         print_zone(zone)
+         if zone.zone_id in extents_in_zone:
+@@ -180,7 +188,7 @@ def cmd_extents(data):
+         file_ids = sorted(set(map(lambda x: x.file_id, extents)))
+         for file_id in file_ids:
+             print(f"  [{file_symbol(file_id)}] ", end="")
+-            print_file(files_map[file_id])
++            print_file_in_zone(files_map[file_id], zone)
+         print("  [_] removed files")
+         print("  [.] unwritten area")
+ 
+@@ -188,7 +196,7 @@ def cmd_extents(data):
+         chunk_start = zone.start
+         current_extent = 0
+         for chunk_id in range(chunk_total):
+-            if chunk_id % 32 == 0:
++            if chunk_id % 128 == 0:
+                 print()
+                 print(f"  0x{chunk_start:012x} ", end="")
+             if chunk_start >= zone.wp:
