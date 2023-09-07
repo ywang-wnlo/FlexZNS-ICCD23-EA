@@ -4,3 +4,6 @@
 [submodule "Softwares/f2fs-tools/base"]
 	path = Softwares/f2fs-tools/base
 	url = git://git.kernel.org/pub/scm/linux/kernel/git/jaegeuk/f2fs-tools.git
+[submodule "Softwares/zenfs/base"]
+	path = Softwares/zenfs/base
+	url = git@github.com:westerndigitalcorporation/zenfs.git
