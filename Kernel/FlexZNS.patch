@@ -1,0 +1,315 @@
+diff --git a/Kernel/linux-5.15.81/Makefile b/Kernel/linux-5.15.81/Makefile
+index cc0a1da24..d01a535b5 100644
+--- a/Kernel/linux-5.15.81/Makefile
++++ b/Kernel/linux-5.15.81/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 5
+ PATCHLEVEL = 15
+ SUBLEVEL = 81
+-EXTRAVERSION =
++EXTRAVERSION = -zone-merge-factor
+ NAME = Trick or Treat
+ 
+ # *DOCUMENTATION*
+diff --git a/Kernel/linux-5.15.81/block/blk-settings.c b/Kernel/linux-5.15.81/block/blk-settings.c
+index b880c70e2..d3afb0a80 100644
+--- a/Kernel/linux-5.15.81/block/blk-settings.c
++++ b/Kernel/linux-5.15.81/block/blk-settings.c
+@@ -57,6 +57,7 @@ void blk_set_default_limits(struct queue_limits *lim)
+ 	lim->misaligned = 0;
+ 	lim->zoned = BLK_ZONED_NONE;
+ 	lim->zone_write_granularity = 0;
++	lim->zone_merge_factor = 1;
+ }
+ EXPORT_SYMBOL(blk_set_default_limits);
+ 
+@@ -646,6 +647,7 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
+ 
+ 	t->zone_write_granularity = max(t->zone_write_granularity,
+ 					b->zone_write_granularity);
++	t->zone_merge_factor = max(t->zone_merge_factor, b->zone_merge_factor);
+ 	t->zoned = max(t->zoned, b->zoned);
+ 	return ret;
+ }
+diff --git a/Kernel/linux-5.15.81/block/blk-sysfs.c b/Kernel/linux-5.15.81/block/blk-sysfs.c
+index 00021f012..dfafa408a 100644
+--- a/Kernel/linux-5.15.81/block/blk-sysfs.c
++++ b/Kernel/linux-5.15.81/block/blk-sysfs.c
+@@ -228,6 +228,28 @@ static ssize_t queue_zone_write_granularity_show(struct request_queue *q,
+ 	return queue_var_show(queue_zone_write_granularity(q), page);
+ }
+ 
++static ssize_t queue_zone_merge_factor_show(struct request_queue *q,
++						 char *page)
++{
++	return queue_var_show(queue_zone_merge_factor(q), page);
++}
++
++static ssize_t queue_zone_merge_factor_store(struct request_queue *q,
++				       const char *page, size_t count)
++{
++	unsigned long zone_merge_factor;
++	ssize_t ret = queue_var_store(&zone_merge_factor, page, count);
++
++	if (ret < 0)
++		return ret;
++
++	spin_lock_irq(&q->queue_lock);
++	q->limits.zone_merge_factor = zone_merge_factor;
++	spin_unlock_irq(&q->queue_lock);
++
++	return ret;
++}
++
+ static ssize_t queue_zone_append_max_show(struct request_queue *q, char *page)
+ {
+ 	unsigned long long max_sectors = q->limits.max_zone_append_sectors;
+@@ -604,6 +626,7 @@ QUEUE_RO_ENTRY(queue_write_same_max, "write_same_max_bytes");
+ QUEUE_RO_ENTRY(queue_write_zeroes_max, "write_zeroes_max_bytes");
+ QUEUE_RO_ENTRY(queue_zone_append_max, "zone_append_max_bytes");
+ QUEUE_RO_ENTRY(queue_zone_write_granularity, "zone_write_granularity");
++QUEUE_RW_ENTRY(queue_zone_merge_factor, "zone_merge_factor");
+ 
+ QUEUE_RO_ENTRY(queue_zoned, "zoned");
+ QUEUE_RO_ENTRY(queue_nr_zones, "nr_zones");
+@@ -660,6 +683,7 @@ static struct attribute *queue_attrs[] = {
+ 	&queue_write_zeroes_max_entry.attr,
+ 	&queue_zone_append_max_entry.attr,
+ 	&queue_zone_write_granularity_entry.attr,
++	&queue_zone_merge_factor_entry.attr,
+ 	&queue_nonrot_entry.attr,
+ 	&queue_zoned_entry.attr,
+ 	&queue_nr_zones_entry.attr,
+diff --git a/Kernel/linux-5.15.81/block/blk-zoned.c b/Kernel/linux-5.15.81/block/blk-zoned.c
+index 774ecc598..445fe5bd6 100644
+--- a/Kernel/linux-5.15.81/block/blk-zoned.c
++++ b/Kernel/linux-5.15.81/block/blk-zoned.c
+@@ -463,12 +463,15 @@ void blk_queue_free_zone_bitmaps(struct request_queue *q)
+ 	q->conv_zones_bitmap = NULL;
+ 	kfree(q->seq_zones_wlock);
+ 	q->seq_zones_wlock = NULL;
++	kfree(q->zno_offset);
++	q->zno_offset = NULL;
+ }
+ 
+ struct blk_revalidate_zone_args {
+ 	struct gendisk	*disk;
+ 	unsigned long	*conv_zones_bitmap;
+ 	unsigned long	*seq_zones_wlock;
++	int		*zno_offset;
+ 	unsigned int	nr_zones;
+ 	sector_t	zone_sectors;
+ 	sector_t	sector;
+@@ -538,6 +541,13 @@ static int blk_revalidate_zone_cb(struct blk_zone *zone, unsigned int idx,
+ 			if (!args->seq_zones_wlock)
+ 				return -ENOMEM;
+ 		}
++		if (!args->zno_offset) {
++			args->zno_offset =
++				kcalloc_node(args->nr_zones, sizeof(int),
++					     GFP_NOIO, q->node);
++			if (!args->zno_offset)
++				return -ENOMEM;
++		}
+ 		break;
+ 	default:
+ 		pr_warn("%s: Invalid zone type 0x%x at sectors %llu\n",
+@@ -613,6 +623,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk,
+ 	if (ret > 0) {
+ 		blk_queue_chunk_sectors(q, args.zone_sectors);
+ 		q->nr_zones = args.nr_zones;
++		swap(q->zno_offset, args.zno_offset);
+ 		swap(q->seq_zones_wlock, args.seq_zones_wlock);
+ 		swap(q->conv_zones_bitmap, args.conv_zones_bitmap);
+ 		if (update_driver_data)
+@@ -624,6 +635,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk,
+ 	}
+ 	blk_mq_unfreeze_queue(q);
+ 
++	kfree(args.zno_offset);
+ 	kfree(args.seq_zones_wlock);
+ 	kfree(args.conv_zones_bitmap);
+ 	return ret;
+@@ -642,6 +654,7 @@ void blk_queue_clear_zone_settings(struct request_queue *q)
+ 	q->max_active_zones = 0;
+ 	q->limits.chunk_sectors = 0;
+ 	q->limits.zone_write_granularity = 0;
++	q->limits.zone_merge_factor = 1;
+ 	q->limits.max_zone_append_sectors = 0;
+ 
+ 	blk_mq_unfreeze_queue(q);
+diff --git a/Kernel/linux-5.15.81/drivers/nvme/host/ioctl.c b/Kernel/linux-5.15.81/drivers/nvme/host/ioctl.c
+index 7397fad4c..3c25a6019 100644
+--- a/Kernel/linux-5.15.81/drivers/nvme/host/ioctl.c
++++ b/Kernel/linux-5.15.81/drivers/nvme/host/ioctl.c
+@@ -53,6 +53,44 @@ static void *nvme_add_user_metadata(struct bio *bio, void __user *ubuf,
+ 	return ERR_PTR(ret);
+ }
+ 
++static void nvme_merge_zones(struct request_queue *q,
++		struct nvme_command *cmd)
++{
++	uint64_t slba = le64_to_cpu(cmd->zms.slba);
++	uint32_t zone_idx = blk_queue_zone_no(q, slba);
++	uint32_t count = le32_to_cpu(cmd->zms.cdw12);
++	uint32_t i = 1;
++
++    for (; i < count; i++)
++    {
++		q->zno_offset[zone_idx + i] = -i;
++    }
++
++	printk("Merge Zone[%d~%d]\n", zone_idx, zone_idx + count - 1);
++}
++
++static void nvme_split_zones(struct request_queue *q,
++		struct nvme_command *cmd)
++{
++	uint64_t slba = le64_to_cpu(cmd->zms.slba);
++	uint32_t zone_idx = blk_queue_zone_no(q, slba);
++	uint32_t i = 1;
++
++    for (; zone_idx + i < q->nr_zones; i++)
++    {
++        if (q->zno_offset[zone_idx + i] == -i)
++        {
++            q->zno_offset[zone_idx + i] = 0;
++        }
++        else
++        {
++            break;
++        }
++    }
++
++    printk("Split Zone[%d~%d]\n", zone_idx, zone_idx + i - 1);
++}
++
+ static int nvme_submit_user_cmd(struct request_queue *q,
+ 		struct nvme_command *cmd, void __user *ubuffer,
+ 		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
+@@ -101,6 +139,16 @@ static int nvme_submit_user_cmd(struct request_queue *q,
+ 			ret = -EFAULT;
+ 	}
+ 	kfree(meta);
++
++	if (cmd->common.opcode == nvme_cmd_zone_mgmt_send)
++	{
++		if (cmd->zms.zsa == NVME_ZONE_MERGE) {
++			nvme_merge_zones(q, cmd);
++		} else if(cmd->zms.zsa == NVME_ZONE_SPLIT) {
++			nvme_split_zones(q, cmd);
++		}
++	}
++
+  out_unmap:
+ 	if (bio)
+ 		blk_rq_unmap_user(bio);
+diff --git a/Kernel/linux-5.15.81/drivers/nvme/host/zns.c b/Kernel/linux-5.15.81/drivers/nvme/host/zns.c
+index d95010481..5bd940d68 100644
+--- a/Kernel/linux-5.15.81/drivers/nvme/host/zns.c
++++ b/Kernel/linux-5.15.81/drivers/nvme/host/zns.c
+@@ -163,7 +163,7 @@ static int nvme_zone_parse_entry(struct nvme_ns *ns,
+ 
+ 	zone.type = BLK_ZONE_TYPE_SEQWRITE_REQ;
+ 	zone.cond = entry->zs >> 4;
+-	zone.len = ns->zsze;
++	zone.len = entry->zlen ? entry->zlen : ns->zsze;
+ 	zone.capacity = nvme_lba_to_sect(ns, le64_to_cpu(entry->zcap));
+ 	zone.start = nvme_lba_to_sect(ns, le64_to_cpu(entry->zslba));
+ 	zone.wp = nvme_lba_to_sect(ns, le64_to_cpu(entry->wp));
+@@ -216,9 +216,8 @@ int nvme_ns_report_zones(struct nvme_ns *ns, sector_t sector,
+ 			if (ret)
+ 				goto out_free;
+ 			zone_idx++;
++			sector += report->entries[i].zlen;
+ 		}
+-
+-		sector += ns->zsze * nz;
+ 	}
+ 
+ 	if (zone_idx > 0)
+diff --git a/Kernel/linux-5.15.81/include/linux/blkdev.h b/Kernel/linux-5.15.81/include/linux/blkdev.h
+index 67344dfe0..eed353799 100644
+--- a/Kernel/linux-5.15.81/include/linux/blkdev.h
++++ b/Kernel/linux-5.15.81/include/linux/blkdev.h
+@@ -320,6 +320,7 @@ struct queue_limits {
+ 	unsigned int		discard_granularity;
+ 	unsigned int		discard_alignment;
+ 	unsigned int		zone_write_granularity;
++	unsigned int		zone_merge_factor;
+ 
+ 	unsigned short		max_segments;
+ 	unsigned short		max_integrity_segments;
+@@ -502,6 +503,7 @@ struct request_queue {
+ 	unsigned long		*seq_zones_wlock;
+ 	unsigned int		max_open_zones;
+ 	unsigned int		max_active_zones;
++	int			*zno_offset;
+ #endif /* CONFIG_BLK_DEV_ZONED */
+ 
+ 	int			node;
+@@ -691,7 +693,8 @@ static inline bool blk_queue_is_zoned(struct request_queue *q)
+ 
+ static inline sector_t blk_queue_zone_sectors(struct request_queue *q)
+ {
+-	return blk_queue_is_zoned(q) ? q->limits.chunk_sectors : 0;
++	return blk_queue_is_zoned(q) ?
++		q->limits.chunk_sectors * q->limits.zone_merge_factor : 0;
+ }
+ 
+ #ifdef CONFIG_BLK_DEV_ZONED
+@@ -703,9 +706,11 @@ static inline unsigned int blk_queue_nr_zones(struct request_queue *q)
+ static inline unsigned int blk_queue_zone_no(struct request_queue *q,
+ 					     sector_t sector)
+ {
++	unsigned int zno = 0;
+ 	if (!blk_queue_is_zoned(q))
+-		return 0;
+-	return sector >> ilog2(q->limits.chunk_sectors);
++		return zno;
++	zno = sector >> ilog2(q->limits.chunk_sectors);
++	return zno + q->zno_offset[zno];
+ }
+ 
+ static inline bool blk_queue_zone_is_seq(struct request_queue *q,
+@@ -1455,6 +1460,12 @@ bdev_zone_write_granularity(struct block_device *bdev)
+ 	return queue_zone_write_granularity(bdev_get_queue(bdev));
+ }
+ 
++static inline unsigned int
++queue_zone_merge_factor(const struct request_queue *q)
++{
++	return q->limits.zone_merge_factor;
++}
++
+ static inline int queue_alignment_offset(const struct request_queue *q)
+ {
+ 	if (q->limits.misaligned)
+diff --git a/Kernel/linux-5.15.81/include/linux/nvme.h b/Kernel/linux-5.15.81/include/linux/nvme.h
+index 039f59ee8..915878f7d 100644
+--- a/Kernel/linux-5.15.81/include/linux/nvme.h
++++ b/Kernel/linux-5.15.81/include/linux/nvme.h
+@@ -583,7 +583,13 @@ struct nvme_zone_descriptor {
+ 	__le64		zcap;
+ 	__le64		zslba;
+ 	__le64		wp;
+-	__u8		rsvd32[32];
++	union {
++		__u8		rsvd32[32];
++		struct {
++			__le64		zlen;
++			__u8		rsvd24[24];
++		};
++	};
+ };
+ 
+ enum {
+@@ -907,6 +913,8 @@ enum nvme_zone_mgmt_action {
+ 	NVME_ZONE_OPEN		= 0x3,
+ 	NVME_ZONE_RESET		= 0x4,
+ 	NVME_ZONE_OFFLINE	= 0x5,
++	NVME_ZONE_MERGE		= 0x6,
++	NVME_ZONE_SPLIT		= 0x7,
+ 	NVME_ZONE_SET_DESC_EXT	= 0x10,
+ };
+ 
