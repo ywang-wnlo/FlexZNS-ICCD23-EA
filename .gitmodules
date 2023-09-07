@@ -1,3 +1,6 @@
 [submodule "FEMU/base"]
 	path = FEMU/base
 	url = git@github.com:vtess/FEMU.git
+[submodule "Softwares/f2fs-tools/base"]
+	path = Softwares/f2fs-tools/base
+	url = git://git.kernel.org/pub/scm/linux/kernel/git/jaegeuk/f2fs-tools.git
