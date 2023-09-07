@@ -1,0 +1,32 @@
+diff --git a/lib/libf2fs_zoned.c b/lib/libf2fs_zoned.c
+index c5c6dde..d81260f 100644
+--- a/lib/libf2fs_zoned.c
++++ b/lib/libf2fs_zoned.c
+@@ -383,6 +383,13 @@ int f2fs_check_zones(int j)
+ 		}
+ 	}
+ 
++	blkz = (struct blk_zone *)(rep + 1);
++	if (dev->zone_size != blk_zone_length(blkz) << SECTOR_SHIFT) {
++			dev->zone_size = blk_zone_length(blkz) << SECTOR_SHIFT;
++			dev->zone_blocks = dev->zone_size >> F2FS_BLKSIZE_BITS;
++			dev->nr_zones = n;
++	}
++
+ 	if (sector != total_sectors) {
+ 		ERR_MSG("Invalid zones: last sector reported is %llu, expected %llu\n",
+ 			(unsigned long long)(sector << 9) / c.sector_size,
+diff --git a/mkfs/f2fs_format.c b/mkfs/f2fs_format.c
+index 2759b5a..c07c12a 100644
+--- a/mkfs/f2fs_format.c
++++ b/mkfs/f2fs_format.c
+@@ -482,8 +482,7 @@ static int f2fs_prepare_super_block(void)
+ 	if (c.overprovision == 0)
+ 		c.overprovision = get_best_overprovision(sb);
+ 
+-	c.reserved_segments =
+-			(2 * (100 / c.overprovision + 1) + NR_CURSEG_TYPE) *
++	c.reserved_segments = NR_CURSEG_TYPE *
+ 			round_up(f2fs_get_usable_segments(sb), get_sb(section_count));
+ 
+ 	if (c.feature & cpu_to_le32(F2FS_FEATURE_RO)) {
