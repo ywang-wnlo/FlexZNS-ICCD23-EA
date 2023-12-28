@@ -2,7 +2,7 @@
 
 This repository contains the source code of the paper "FlexZNS: Building High-Performance ZNS SSDs with Size-Flexible and Parity-Protected Zones" published in IEEE International Conference on Computer Design (ICCD'23).
 
-The url of the paper is [TODO](https://www.iccd-conf.com/Home.html).
+The url of the paper is [https://ieeexplore.ieee.org/document/10361036](https://ieeexplore.ieee.org/document/10361036).
 
 If there are any bugs in the code, please contact the me by github issues (English only) or emails (Chinese is OK).
 
